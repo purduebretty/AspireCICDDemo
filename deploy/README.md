@@ -74,11 +74,33 @@ and `appsettings.{env}.json`, so they split cleanly:
   }
   ```
 
-  `dev` and `staging` enable public access on the password vault so password persistence
-  actually works; **production omits it** and stays `Disabled`, per the org's no-public-endpoint
-  policy — which means production regenerates the data-service passwords on every deploy and
-  stamps a new revision to keep them in lockstep. Add the same `PasswordVault` block to make
-  production persist them too.
+  Two resources have a public-network-access switch, because the Container Apps environment has
+  **no VNet and no private endpoints** — a private-only resource isn't reachable from the
+  container apps at all:
+
+  | Switch | Default | Effect when `Disabled` |
+  |---|---|---|
+  | `Storage` | **`Enabled`** (every environment) | avatar upload fails with `403 AuthorizationFailure` |
+  | `PasswordVault` | `Disabled` | passwords regenerate every deploy, with a revision stamp to keep services in lockstep |
+
+  Storage defaults to `Enabled` everywhere, production included: an account nothing can reach
+  isn't a safer demo, just a broken one. That conflicts with the org's "storage accounts should
+  disable public network access" policy — a deliberate, reversible trade for this demo. Note what
+  it does *not* do: `allowSharedKeyAccess` and `allowBlobPublicAccess` stay `false`
+  unconditionally, so there are no SAS tokens, no account keys, and no anonymous containers; every
+  request is still an authenticated Azure AD call from a principal holding `Storage Blob Data
+  Contributor`. What it adds is that the endpoint answers from the internet at all.
+
+  Lock either one down per environment once that environment has a VNet and a private endpoint:
+
+  ```json
+  { "Storage": { "PublicNetworkAccess": "Disabled" } }
+  ```
+
+  **`403 AuthorizationFailure` from Blob Storage is usually the network, not RBAC.** Azure Storage
+  reports a network-rule denial with the same generic code it uses for permission denials, so the
+  error points at the wrong thing. Check `publicNetworkAccess` on the account before auditing role
+  assignments.
 
 **One resource group per environment holds everything.** `Azure:ResourceGroup`
 (`brett-aspire-demo-{env}`) is the default scope for every resource Aspire provisions — the

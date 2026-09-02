@@ -91,18 +91,29 @@ var storage = builder.AddAzureStorage("storage").RunAsEmulator();
 var blobs = storage.AddBlobs("blobs");
 storage.AddBlobContainer("userimages", blobContainerName: "userimages");
 
-// Org policy forbids public storage ("Storage accounts should disable public network access"),
-// which blocks provisioning otherwise. The server reaches blobs via its managed identity
-// (Azure AD), so key auth and public blobs stay off too. NOTE: this shared ACA environment has
-// no VNet, so a private-only storage account is NOT reachable from the container apps — the
-// avatar feature won't work at runtime until the environment is VNet-integrated with a private
-// endpoint. (Provisioning + everything else still succeeds; only blob access is affected.)
+// Org policy is "storage accounts should disable public network access". But the Container Apps
+// environment has no VNet and no private endpoint, so a private-only account is simply
+// UNREACHABLE from the container apps: avatar upload fails at runtime with
+// "403 AuthorizationFailure" — which reads like an RBAC problem and isn't. Azure Storage reports
+// a network-rule denial with the same generic code it uses for permission denials.
+//
+// So this DEFAULTS TO ENABLED — a storage account nothing can reach isn't a safer demo, just a
+// broken one. Flip it per environment once that environment has a VNet and a private endpoint:
+// "Storage": { "PublicNetworkAccess": "Disabled" } in appsettings.{env}.json.
+//
+// Enabling the network path is NOT the same as making data public: shared-key auth and
+// anonymous blob access stay off unconditionally below, so every request still has to be an
+// authenticated Azure AD call from a principal holding Storage Blob Data Contributor. The
+// exposure this adds is that the endpoint answers from the internet at all.
+var storagePublicAccess = builder.Configuration["Storage:PublicNetworkAccess"] ?? "Enabled";
 storage.ConfigureInfrastructure(infra =>
 {
     var account = infra.GetProvisionableResources().OfType<StorageAccount>().Single();
-    account.PublicNetworkAccess = StoragePublicNetworkAccess.Disabled;
-    account.AllowSharedKeyAccess = false;
-    account.AllowBlobPublicAccess = false;
+    account.PublicNetworkAccess = string.Equals(storagePublicAccess, "Enabled", StringComparison.OrdinalIgnoreCase)
+        ? StoragePublicNetworkAccess.Enabled
+        : StoragePublicNetworkAccess.Disabled;
+    account.AllowSharedKeyAccess = false;      // Azure AD only — no SAS, no account keys
+    account.AllowBlobPublicAccess = false;     // no anonymous containers
 });
 
 // API backend (ASP.NET Core). The frontend is now its own image (below), so the server just
