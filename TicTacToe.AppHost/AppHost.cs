@@ -162,12 +162,12 @@ if (builder.ExecutionContext.IsPublishMode)
 }
 
 // --- Azure deployment (publish/deploy only) --------------------------------
-// Images are pushed to the existing igsops registry, which lives in the Enterprise
-// Production subscription. The container apps deploy into an existing Container Apps
-// environment in the Enterprise Dev/Test subscription and pull from igsops using a
-// pre-created user-assigned identity that already holds AcrPull on igsops (provisioned
-// via Terraform). Because the registry is in a different subscription than everything
-// else, it's referenced with PublishAsExistingInResourceGroup(name, rg, subscription)
+// Images are pushed to an existing shared registry — WHICH registry is never hardcoded here:
+// it comes from the acr-name parameter, looked up in acr-rg / acr-subscription. The container
+// apps pull from it with a pre-created user-assigned identity that already holds AcrPull on it
+// (when acr-pull-identity-name names one). That registry may live in a different subscription
+// than everything else, which is why it's referenced with
+// PublishAsExistingInResourceGroup(name, rg, subscription)
 // (Aspire 13.5+) so the lookup is scoped to the right subscription. WithAcrPullIdentity
 // still tells Aspire to use that identity rather than minting its own AcrPull role
 // assignment — a cross-subscription role assignment would require the deploy principal
@@ -185,7 +185,7 @@ if (builder.ExecutionContext.IsPublishMode)
 // live in the base appsettings.json. Note this is distinct from `aca-env-rg`: the container apps
 // land in their per-env RG and attach to that environment's own existing ACA environment
 // (referenced as existing via aca-env-name / aca-env-rg per environment), and all pull from the
-// one shared igsops registry.
+// one shared registry.
 if (builder.ExecutionContext.IsPublishMode)
 {
     // --- Per-environment password vault (created BY Aspire in each env's RG) ------------
@@ -286,7 +286,7 @@ if (builder.ExecutionContext.IsPublishMode)
     // Shared across all environments (appsettings.json).
     var acrName = builder.AddParameter("acr-name");
     var acrRg = builder.AddParameter("acr-rg");
-    var acrSub = builder.AddParameter("acr-subscription");   // igsops lives in Enterprise Production.
+    var acrSub = builder.AddParameter("acr-subscription");   // may differ from target-subscription.
 
     // Environment-specific (appsettings.{env}.json). Everything except the ACR
     // lives in the Enterprise Dev/Test subscription (target-subscription). The aca-env-* /
@@ -309,8 +309,9 @@ if (builder.ExecutionContext.IsPublishMode)
     // no resource at all is a deliberate "Aspire owns this one" — omit aca-env-name/-rg or
     // acr-pull-identity-name/-rg from appsettings.{env}.json to have Aspire create and manage it.
     // Set "Azure": { "CreateMissingInfrastructure": false } to always reference as existing.
-    // The registry is deliberately NOT auto-created: igsops is a shared org registry in another
-    // subscription, and silently standing up a second one would push images nowhere useful.
+    // The registry is deliberately NOT auto-created: it's a shared, pre-existing registry
+    // (possibly in another subscription), and silently standing up a second one would push
+    // images nowhere useful.
     var createMissing = !string.Equals(
         builder.Configuration["Azure:CreateMissingInfrastructure"], "false",
         StringComparison.OrdinalIgnoreCase);
@@ -401,7 +402,7 @@ if (builder.ExecutionContext.IsPublishMode)
 
 
     // Only the registry is cross-subscription, so it carries its own subscription scope.
-    var igsops = builder.AddAzureContainerRegistry("igsops")
+    var acr = builder.AddAzureContainerRegistry("acr")
         .PublishAsExistingInResourceGroup(acrName, acrRg, acrSub);
 
     var acaEnv = builder.AddAzureContainerAppEnvironment("acaenv");
@@ -432,7 +433,7 @@ if (builder.ExecutionContext.IsPublishMode)
             targetSub);
     }
 
-    acaEnv.WithAzureContainerRegistry(igsops);
+    acaEnv.WithAzureContainerRegistry(acr);
 
     // WithAcrPullIdentity is BYO-identity: it tells Aspire to pull with the identity given and
     // to mint NO role assignment. That is only correct when the identity already exists AND

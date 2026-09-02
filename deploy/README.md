@@ -9,20 +9,20 @@ There are three ways to deploy:
   publishes the Bicep for every environment as an artifact, then deploys staging and
   production. See [CI/CD via GitHub Actions](#cicd-via-github-actions).
 - **Azure DevOps → Octopus** (CI/CD) — [`azure-pipelines.yml`](../azure-pipelines.yml) at the
-  repo root builds the app, `aspire do push`es the image to igsops, publishes the per-env
+  repo root builds the app, `aspire do push`es the image to the registry, publishes the per-env
   Bicep, zips it, and pushes the package to Octopus; Octopus runs the deployment. See
   [CI/CD via Azure DevOps + Octopus](#cicd-via-azure-devops--octopus) at the end.
 
 Both share the model below.
 
-The container registry (`igsops`, **Enterprise Production**) and the Container Apps
-environment (**Enterprise Dev/Test**) can live in different subscriptions. This works because:
+The container registry and the Container Apps environment can live in different
+subscriptions. **Which registry is never hardcoded** — it comes from the `acr-name` parameter,
+looked up in `acr-rg` / `acr-subscription` (see `appsettings.json`). This works because:
 
-- Images are **pushed to `igsops`** (referenced as an *existing* registry).
-- The apps **pull from `igsops` using a pre-created user-assigned identity**
-  (`uai-brett-aspire-demp`) that already holds `AcrPull` on `igsops` (provisioned via
-  Terraform). `WithAcrPullIdentity` in the AppHost tells Aspire to use that identity
-  instead of creating its own + a (cross-subscription, impossible) role assignment.
+- Images are **pushed to that registry** (referenced as an *existing* resource).
+- The apps **pull from it using a pre-created user-assigned identity** that already holds
+  `AcrPull` on the registry. `WithAcrPullIdentity` in the AppHost tells Aspire to use that
+  identity instead of creating its own + a (cross-subscription, impossible) role assignment.
 
 So Aspire creates **no role assignments** and **no extra registry** — see
 [../TicTacToe.AppHost/AppHost.cs](../TicTacToe.AppHost/AppHost.cs). Because the AppHost
@@ -85,10 +85,10 @@ and `appsettings.{env}.json`, so they split cleanly:
 container apps, the Container Apps environment, storage, the password vault, and the managed
 identities — and the deployment creates that RG itself (`AllowResourceGroupCreation`).
 
-**The container registry is the only outlier.** `igsops` is a pre-existing shared registry, so
-it keeps its own `acr-rg` + `acr-subscription`, and the generated template scopes exactly two
-modules there: the registry reference and the `AcrPull` role assignment (which has to be scoped
-where the registry lives). Everything else is scoped to `rg`.
+**The container registry is the only outlier.** It's a pre-existing shared registry, so it keeps
+its own `acr-rg` + `acr-subscription`, and the generated template scopes exactly two modules
+there: the registry reference (`acr`) and the `AcrPull` role assignment `acaenv-mi-roles-acr`
+(which has to be scoped where the registry lives). Everything else is scoped to `rg`.
 
 That's why `aca-env-rg` and `acr-pull-identity-rg` are absent from the env files: **they default
 to `Azure:ResourceGroup`**. Set one only to point at a resource that lives somewhere else — a
@@ -130,8 +130,8 @@ Two things worth knowing:
   that already holds `AcrPull`. When the configured identity isn't found, the AppHost passes
   *none*, so Aspire creates its own identity **and** the `AcrPull` role assignment — which needs
   RBAC-write in the registry's subscription. That works for a same-subscription registry; for
-  the cross-subscription `igsops` it does not, so pre-create the identity with `AcrPull` in
-  Terraform and name it in config. (Handing `WithAcrPullIdentity` a freshly created identity is
+  a cross-subscription registry it does not, so pre-create the identity with `AcrPull` and name
+  it in config. (Handing `WithAcrPullIdentity` a freshly created identity is
   what produces `unable to pull image using Managed identity …` on every revision.)
 - **A created ACA environment lands in `Azure:ResourceGroup`** — Aspire provisions one
   deployment into one RG. It keeps the configured `aca-env-name`, and since `aca-env-rg`
@@ -139,8 +139,8 @@ Two things worth knowing:
   re-provisioning it (~10 minutes each time). Only an environment deliberately placed elsewhere
   needs `aca-env-rg` set.
 
-The **registry is never auto-created**: `igsops` is a shared org registry in another
-subscription, and standing up a second one would push images nowhere useful.
+The **registry is never auto-created**: it's a shared, pre-existing registry (possibly in
+another subscription), and standing up a second one would push images nowhere useful.
 
 Set `"Azure": { "CreateMissingInfrastructure": false }` to disable the probes and always
 reference everything as existing.
@@ -186,7 +186,7 @@ environment, so `appsettings.{env}.json` loads). Always pass it — the default 
 `Production`, which has no matching file here.
 
 ```bash
-az login                       # a principal with Contributor on the Dev/Test RGs + Reader on igsops
+az login                       # a principal with Contributor on the target RGs + AcrPush on the registry
 aspire deploy -e dev           # builds & pushes the image, provisions brett-aspire-demo-dev, deploys the apps
 ```
 
@@ -210,6 +210,7 @@ aspire publish -e dev -o ./artifacts   # writes main.bicep + per-resource module
 [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) runs on every push to `main`
 (and on demand via **Run workflow**):
 
+0. **`version`** — computes the build number once (see below) and exposes it as a job output.
 1. **`publish-bicep`** — a matrix over `staging` and `production` runs `aspire publish -e {env}`
    and uploads `main.bicep` plus the per-resource modules as the artifact `bicep-{env}`
    (30-day retention). Staging doesn't consume it — `aspire deploy` regenerates the same
@@ -221,6 +222,38 @@ aspire publish -e dev -o ./artifacts   # writes main.bicep + per-resource module
 The two deploy jobs are deliberately different, because the contrast is the point: staging shows
 what the tool does for you, production shows what that costs when you hand the artifact to a
 separate release process (Octopus, an ADO release stage, a platform team).
+
+### Build numbering
+
+GitHub has no built-in build counter like Azure DevOps' `Build.BuildId`. The closest equivalent
+is `github.run_number`, and the workflow builds the image tag from it:
+
+```
+{date}.{run_number}      e.g.  2026.09.02.42
+```
+
+| Part | Why |
+|---|---|
+| `date` (UTC) | sorts chronologically and is readable at a glance in the registry |
+| `run_number` | monotonic per workflow, so builds order unambiguously within a day |
+
+The commit isn't in the tag. The run summary prints it alongside the build number, and the run
+itself records it, so `2026.09.02.42` is enough to find the commit that produced an image.
+
+Two details that matter more than they look:
+
+- **`run_number`, not `run_attempt`.** `run_number` is stable across re-runs of the same run.
+  Production promotes the image staging pushed, so re-running production alone must resolve to the
+  same tag — with `run_attempt` in the tag it would compute a new one and deploy an image that was
+  never published.
+- **Computed once, in its own job.** Every other job reads
+  `needs.version.outputs.image-tag` rather than recomputing. The date component is why: an approval
+  gate can hold production until the next day, and a per-job `date` would silently produce a
+  different tag than the one staging pushed.
+
+The same value flows everywhere: `aspire publish`/`aspire deploy` receive it as
+`--Parameters:image-tag`, the production job passes it into the container-app modules, and ARM
+deployments are named with the build number so the portal's history matches the run.
 
 ### Setup
 
@@ -295,8 +328,8 @@ reviewers to `production` turns the last job into an approval gate — the jobs 
   `appsettings.{env}.json` on each run. That sidesteps the stale-state traps described above,
   and it means generated passwords come from the password vault (or regenerate, with a revision
   stamp, when the vault isn't readable).
-- The image tag is the commit sha, so a deployed revision traces back to a commit. Retrying a
-  failed run reuses the same tag.
+- Every ARM deployment is named with the build number (`aspire-prod-42`, `aspire-server-42`), so
+  the portal's deployment history lines up with the workflow run.
 - Runners are `linux/amd64`, matching what Azure Container Apps requires — no `--platform` flag
   is needed here, unlike local builds on Apple Silicon.
 
@@ -312,27 +345,35 @@ so the job re-declares all of it in `env:`. Change `appsettings.production.json`
 drifts — the templates would be regenerated correctly while the job keeps deploying with stale
 values.
 
-**2. `main.bicep` doesn't contain the apps.** It is subscription-scoped and provisions the shared
+**2. Passwords become your problem.** The data-service passwords are plain template parameters.
+`aspire deploy` generates them, writes them to the password vault, and reads them back on the next
+run. This path has none of that, so the job generates fresh ones each time — which restarts cache
+and postgres on every deploy — and has to thread the identical values through all four modules or
+the server won't match its data services.
+
+**3. The parameter surface isn't stable.** The AppHost probes Azure while publishing, so whether
+the Container Apps environment already exists decides whether the template *creates* it or
+*references* it — and referencing it adds `aca_env_name`, `aca_env_rg`, and `target_subscription`
+parameters that a first-ever deploy doesn't have. The same commit publishes a 6-parameter template
+against an empty subscription and a 9-parameter one afterwards. A hardcoded `--parameters` list
+breaks the first time that flips, so the job reads the parameters the template actually declares
+(`az bicep build … | jq '.parameters | keys[]'`) and fails loudly on any it can't supply.
+
+**4. `main.bicep` doesn't contain the apps.** It is subscription-scoped and provisions the shared
 infrastructure: the resource group, the Container Apps environment, storage, the password vault,
 the identities, the role assignments. Each container app is a *separate* resource-group-scoped
 template that Aspire deploys itself, wiring ~11 parameters from `main`'s outputs. "Just deploy the
 Bicep" is really five deployments, and that wiring is now yours to maintain — including the
 server's container port, which nothing in the artifact tells you (it's `8080`).
 
-**3. Passwords become your problem.** The data-service passwords are plain template parameters.
-`aspire deploy` generates them, writes them to the password vault, and reads them back on the next
-run. This path has none of that, so the job generates fresh ones each time — which restarts cache
-and postgres on every deploy — and has to thread the identical values through all four modules or
-the server won't match its data services.
-
-**4. Nothing builds or pushes an image.** The tags production deploys exist only because
+**5. Nothing builds or pushes an image.** The tags production deploys exist only because
 `deploy-staging` pushed them earlier in the same run. That makes production a true promotion of
 the bits staging validated — but a production-only run would point the apps at images that were
 never published.
 
-**5. Publish-time values are frozen.** Anything the AppHost computes while generating templates is
-baked in: the probe results for existing resources, the deployer's object id in the vault role
-assignment, and `ASPIRE_DEPLOY_STAMP`. That last one is why `publish-bicep` passes the same
+**6. Publish-time values are frozen.** Anything the AppHost computes while generating templates is
+baked in: the probe results above, the deployer's object id in the vault role assignment, and
+`ASPIRE_DEPLOY_STAMP`. That last one is why `publish-bicep` passes the same
 `--Parameters:image-tag=${{ github.sha }}` the deploy uses — without it the stamp would be
 `latest` and the data services would never get a new revision. An artifact is only valid for the
 target and the moment it was published against.
@@ -367,7 +408,7 @@ deploys that artifact verbatim.
 the actual deploy**. Per run it:
 
 1. builds the .NET solution and the Vite frontend (fail fast);
-2. `aspire do push`es the server image to `igsops` (built once — the image is env-agnostic),
+2. `aspire do push`es the server image to the registry (built once — the image is env-agnostic),
    tagged with the run number;
 3. `aspire publish`es the Bicep for every environment into `bicep/<env>/`, zips it into one
    `TicTacToe.Deploy.<version>.zip`, and pushes that package to Octopus.
@@ -376,7 +417,7 @@ The image tag and the package version are the same value, so an Octopus release 
 exact image the run built.
 
 **Configure before first run** (Azure DevOps): an ARM service connection with `AcrPush` on
-`igsops` (Enterprise Production), an *Octopus Deploy* service connection (needs the Octopus
+the container registry, an *Octopus Deploy* service connection (needs the Octopus
 marketplace extension), and your Octopus space/project — all named at the top of the pipeline
 (move them to a variable group if you prefer).
 

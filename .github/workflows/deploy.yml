@@ -25,11 +25,50 @@ env:
   DOTNET_NOLOGO: true
 
 jobs:
+  # ONE source of truth for the build number, computed once and passed to every other job.
+  # GitHub has no built-in build counter like ADO's Build.BuildId; `github.run_number` is the
+  # closest equivalent — it increments per workflow and, unlike `run_attempt`, is STABLE across
+  # re-runs of the same run. That stability matters here: production promotes the image staging
+  # pushed, so a re-run of production alone must resolve to the same tag or it would point at an
+  # image nobody published.
+  #
+  #   {date}.{run_number}   e.g. 2026.09.02.42
+  #
+  #     date        sorts chronologically and is readable at a glance in the registry
+  #     run_number  monotonic per workflow, so builds order unambiguously within a day
+  #
+  # The commit isn't in the tag — the run summary and the workflow run record that. Computing the
+  # tag in its own job rather than per-job is what keeps it identical across an approval gate that
+  # may hold production until the next day.
+  version:
+    name: Build number
+    runs-on: ubuntu-latest
+    outputs:
+      build-number: ${{ steps.compute.outputs.build-number }}
+      image-tag: ${{ steps.compute.outputs.image-tag }}
+    steps:
+      - id: compute
+        run: |
+          set -euo pipefail
+          BUILD_NUMBER="${{ github.run_number }}"
+          IMAGE_TAG="$(date -u +%Y.%m.%d).${BUILD_NUMBER}"
+          echo "build-number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "image-tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Build number | \`$BUILD_NUMBER\` |"
+            echo "| Image tag | \`$IMAGE_TAG\` |"
+            echo "| Commit | \`$GITHUB_SHA\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # Renders main.bicep + the per-resource modules for every environment and uploads them.
-  # This is for review and audit — `aspire deploy` regenerates the same templates from the same
-  # AppHost and config, so the deploy jobs don't consume the artifact.
+  # Staging doesn't consume the artifact (`aspire deploy` regenerates the templates itself), but
+  # deploy-production applies this exact output — so the build number has to be baked in here too,
+  # since publish-time values like ASPIRE_DEPLOY_STAMP are frozen into the templates.
   publish-bicep:
     name: Publish Bicep (${{ matrix.environment }})
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -48,9 +87,8 @@ jobs:
       # probes Azure while generating templates (does the ACA environment exist? is the resource
       # group mid-deletion? who is the deploying principal?), so without a login the generated
       # Bicep would not match what deploys.
-
       - name: Publish Bicep
-        run: aspire publish -e ${{ matrix.environment }} --non-interactive -o ./artifacts -- --Parameters:image-tag=${{ github.sha }}
+        run: aspire publish -e ${{ matrix.environment }} --non-interactive -o ./artifacts -- --Parameters:image-tag=${{ needs.version.outputs.image-tag }}
         env:
           Azure__CredentialSource: AzureCli
 
@@ -63,7 +101,7 @@ jobs:
 
   deploy-staging:
     name: Deploy staging
-    needs: publish-bicep
+    needs: [version, publish-bicep]
     if: inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
@@ -80,12 +118,12 @@ jobs:
           subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
 
       # Builds and pushes both images, provisions the Bicep, and deploys the container apps.
-      # The commit sha is the image tag, so a deploy is traceable to a commit and every app
-      # gets a new revision. This is the ONLY job that builds images — production reuses these
-      # exact ones (see below). A runner starts with no Aspire deployment state, so every value
-      # resolves from appsettings.{env}.json — nothing is cached between runs.
+      # Images are tagged with the build number from the `version` job, so a running revision
+      # traces back to a build and a commit. This is the ONLY job that builds images —
+      # production promotes these exact ones. A runner starts with no Aspire deployment state,
+      # so every value resolves from appsettings.{env}.json; nothing is cached between runs.
       - name: Build, push and deploy
-        run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ github.sha }}
+        run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ needs.version.outputs.image-tag }}
         env:
           Azure__CredentialSource: AzureCli
 
@@ -96,7 +134,7 @@ jobs:
   # the open — see "Deploying the published Bicep" in deploy/README.md for the full list.
   deploy-production:
     name: Deploy production (from published Bicep)
-    needs: [publish-bicep, deploy-staging]
+    needs: [version, publish-bicep, deploy-staging]
     # Runs after staging on push; a manual run can target production directly.
     if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') && needs.publish-bicep.result == 'success'
     runs-on: ubuntu-latest
@@ -115,6 +153,9 @@ jobs:
       ACR_RG: brett-demo-resources
       ACR_SUBSCRIPTION: 82a8659c-720d-48ab-a58e-bdaa5d42c92a
       SERVER_CONTAINER_PORT: "8080"
+      TARGET_SUBSCRIPTION: ${{ secrets.SUBSCRIPTION_ID }}
+      BUILD_NUMBER: ${{ needs.version.outputs.build-number }}
+      IMAGE_TAG: ${{ needs.version.outputs.image-tag }}
     steps:
       # No checkout: this job consumes the artifact, not the source.
       - name: Download published Bicep
@@ -159,24 +200,60 @@ jobs:
 
       # main.bicep is SUBSCRIPTION-scoped: it creates the resource group and everything shared —
       # ACA environment, storage, key vault, identities, role assignments.
+      #
+      # DRAWBACK #3: the template's PARAMETER SURFACE is not stable. The AppHost probes Azure
+      # while publishing, so whether the ACA environment already exists decides whether it is
+      # created or referenced — and referencing it adds aca_env_name / aca_env_rg /
+      # target_subscription parameters that a freshly-provisioned target doesn't have. A fixed
+      # list of --parameters silently breaks the first time that flips. So: read the parameters
+      # the template actually declares and supply exactly those, failing loudly on one we don't
+      # know about.
       - name: Deploy infrastructure (main.bicep)
         run: |
           set -euo pipefail
+
+          # Only needed when the ACA environment is referenced as existing — in which case it
+          # exists, so ask Azure rather than hardcoding the AppHost's derived name.
+          ACA_ENV_NAME=$(az containerapp env list -g "$RESOURCE_GROUP" --query "[0].name" -o tsv 2>/dev/null || true)
+
+          value_for() {
+            case "$1" in
+              resourceGroupName)   echo "$RESOURCE_GROUP" ;;
+              location)            echo "$LOCATION" ;;
+              principalId)         echo "$PRINCIPAL_ID" ;;
+              acr_name)            echo "$ACR_NAME" ;;
+              acr_rg)              echo "$ACR_RG" ;;
+              acr_subscription)    echo "$ACR_SUBSCRIPTION" ;;
+              aca_env_name)        echo "$ACA_ENV_NAME" ;;
+              aca_env_rg)          echo "$RESOURCE_GROUP" ;;
+              target_subscription) echo "$TARGET_SUBSCRIPTION" ;;
+              *)                   return 1 ;;
+            esac
+          }
+
+          ARGS=()
+          for name in $(az bicep build --file ./bicep/main.bicep --stdout | jq -r '.parameters | keys[]'); do
+            if ! value=$(value_for "$name"); then
+              echo "::error::main.bicep declares parameter '$name', which this workflow has no value for."
+              exit 1
+            fi
+            if [ -z "$value" ]; then
+              echo "::error::main.bicep needs parameter '$name' but the resolved value is empty."
+              exit 1
+            fi
+            ARGS+=("$name=$value")
+          done
+          echo "Passing: ${ARGS[*]}"
+
           az deployment sub create \
-            --name "aspire-prod-$GITHUB_RUN_ID" \
+            --name "aspire-prod-$BUILD_NUMBER" \
             --location "$LOCATION" \
             --template-file ./bicep/main.bicep \
-            --parameters \
-              resourceGroupName="$RESOURCE_GROUP" \
-              location="$LOCATION" \
-              principalId="$PRINCIPAL_ID" \
-              acr_name="$ACR_NAME" \
-              acr_rg="$ACR_RG" \
-              acr_subscription="$ACR_SUBSCRIPTION" \
+            --parameters "${ARGS[@]}" \
             --query properties.outputs -o json > infra-outputs.json
           cat infra-outputs.json
 
-      # DRAWBACK #3: main.bicep does NOT include the container apps. Aspire deploys each app as
+      # DRAWBACK #4: main.bicep does NOT include the container apps. Aspire deploys each app as
       # its own resource-group-scoped deployment, wiring parameters from the outputs above — so
       # "just deploy the Bicep" is really five deployments, and this wiring is the part you own.
       - name: Deploy container apps
@@ -191,17 +268,17 @@ jobs:
           SERVER_IDENTITY_CLIENT_ID=$(out aspire_server_identity_clientId)
           BLOB_ENDPOINT=$(out storage_blobEndpoint)
 
-          # DRAWBACK #4: nothing here builds or pushes an image. These tags exist only because
+          # DRAWBACK #5: nothing here builds or pushes an image. These tags exist only because
           # deploy-staging pushed them earlier in this run — production is a pure promotion, and
           # a production-only run would reference images that were never published.
-          SERVER_IMAGE="$ACR_NAME.azurecr.io/aspire-server:$GITHUB_SHA"
-          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/aspire-webfrontend:$GITHUB_SHA"
+          SERVER_IMAGE="$ACR_NAME.azurecr.io/aspire-server:$IMAGE_TAG"
+          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/aspire-webfrontend:$IMAGE_TAG"
 
           deploy_app() {
             local name=$1; shift
             echo "::group::$name"
             az deployment group create \
-              --name "$name-$GITHUB_RUN_ID" \
+              --name "$name-$BUILD_NUMBER" \
               --resource-group "$RESOURCE_GROUP" \
               --template-file "./bicep/$name/$name.bicep" \
               --parameters \
