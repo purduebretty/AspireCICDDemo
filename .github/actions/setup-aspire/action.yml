@@ -1,0 +1,42 @@
+name: Setup Aspire
+description: Installs the .NET SDK and the Aspire CLI, then logs in to Azure via OIDC. Requires the repo to be checked out first.
+
+# A composite action cannot read the `secrets` context, so the caller passes these in from
+# repository secrets. They identify the user-assigned managed identity `uai-brett-github`
+# (resource group brett-demo-resources), whose federated credentials cover this repo's main
+# branch and its staging/production environments.
+inputs:
+  client-id:
+    description: Client id of the user-assigned identity to log in as
+    required: true
+  tenant-id:
+    description: Entra tenant id
+    required: true
+  subscription-id:
+    description: Subscription to deploy into
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # actions/setup-dotnet@v4
+    - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+      with:
+        dotnet-version: 10.0.x
+        dotnet-quality: preview
+
+    - name: Install Aspire CLI
+      shell: bash
+      run: |
+        curl -sSL https://aspire.dev/install.sh | bash
+        echo "$HOME/.aspire/bin" >> "$GITHUB_PATH"
+
+    # Needs `permissions: id-token: write` on the calling job — that's what mints the OIDC
+    # token Azure exchanges against the identity's federated credential.
+    - name: Azure login
+      # azure/login@v2
+      uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        subscription-id: ${{ inputs.subscription-id }}

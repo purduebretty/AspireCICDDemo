@@ -1,10 +1,13 @@
 # Deploying to Azure
 
-There are two ways to deploy:
+There are three ways to deploy:
 
 - **`aspire deploy`** (direct / local) — builds and pushes the image, provisions the
   per-environment resource group, and deploys the container apps in one command. Best for
   ad-hoc and local deploys. Covered below.
+- **GitHub Actions** (CI/CD) — [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml)
+  publishes the Bicep for every environment as an artifact, then deploys staging and
+  production. See [CI/CD via GitHub Actions](#cicd-via-github-actions).
 - **Azure DevOps → Octopus** (CI/CD) — [`azure-pipelines.yml`](../azure-pipelines.yml) at the
   repo root builds the app, `aspire do push`es the image to igsops, publishes the per-env
   Bicep, zips it, and pushes the package to Octopus; Octopus runs the deployment. See
@@ -33,13 +36,19 @@ Production/Dev-Test split with no manual patching.
 Deploy values come from .NET configuration, merged **per key** across `appsettings.json`
 and `appsettings.{env}.json`, so they split cleanly:
 
-- **Shared across every environment → `appsettings.json`** — the registry (always `igsops`)
-  plus the deploy subscription/location:
+- **Shared across every environment → `appsettings.json`** — `app-name`, the registry, and
+  the deploy subscription/location:
   ```json
   {
-    "Parameters": { "acr-name": "igsops", "acr-rg": "IGS-DevOps" },
+    "Parameters": {
+      "app-name": "aspire",
+      "acr-name": "bgoldmandemo",
+      "acr-rg": "brett-demo-resources",
+      "acr-subscription": "82a8659c-…",
+      "target-subscription": "82a8659c-…"
+    },
     "Azure": {
-      "SubscriptionId": "2642b41d-…",
+      "SubscriptionId": "82a8659c-…",
       "Location": "eastus2",
       "AllowResourceGroupCreation": true
     }
@@ -49,21 +58,27 @@ and `appsettings.{env}.json`, so they split cleanly:
 
   | File | Environment | Target resource group |
   |------|-------------|-----------------------|
-  | `appsettings.local.json` | local | (run-mode; not an Azure deploy target) |
-  | `appsettings.dev.json`   | dev   | `brett-aspire-demo-dev` |
-  | `appsettings.int.json`   | int   | `brett-aspire-demo-int` |
-  | `appsettings.qa.json`    | qa    | `brett-aspire-demo-qa` |
-  | `appsettings.prod.json`  | prod  | `brett-aspire-demo-prod` |
+  | `appsettings.Development.json` | local | (run-mode; not an Azure deploy target) |
+  | `appsettings.dev.json`         | dev   | `brett-aspire-demo-dev` |
+  | `appsettings.staging.json`     | staging | `brett-aspire-demo-staging` |
+  | `appsettings.production.json`  | production | `brett-aspire-demo-production` |
+
+  The file name must match the `-e` value exactly — **config file lookup is case-sensitive on
+  Linux**, so the CI runners need `-e staging`, not `-e Staging`. Each file holds only what
+  actually differs:
 
   ```json
   {
-    "Parameters": { "app-name": "aspire" },
-    "Azure": {
-      "ResourceGroup": "brett-aspire-demo-dev",
-      "AllowResourceGroupCreation": true
-    }
+    "Azure": { "ResourceGroup": "brett-aspire-demo-staging" },
+    "PasswordVault": { "PublicNetworkAccess": "Enabled" }
   }
   ```
+
+  `dev` and `staging` enable public access on the password vault so password persistence
+  actually works; **production omits it** and stays `Disabled`, per the org's no-public-endpoint
+  policy — which means production regenerates the data-service passwords on every deploy and
+  stamps a new revision to keep them in lockstep. Add the same `PasswordVault` block to make
+  production persist them too.
 
 **One resource group per environment holds everything.** `Azure:ResourceGroup`
 (`brett-aspire-demo-{env}`) is the default scope for every resource Aspire provisions — the
@@ -189,6 +204,90 @@ aspire publish -e dev -o ./artifacts   # writes main.bicep + per-resource module
 > Postgres runs **without** a persistent volume (org policy forbids storage accounts with
 > public network access), so game history resets if the `postgres` app restarts — fine for
 > a live demo.
+
+## CI/CD via GitHub Actions
+
+[`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) runs on every push to `main`
+(and on demand via **Run workflow**):
+
+1. **`publish-bicep`** — a matrix over `staging` and `production` runs `aspire publish -e {env}`
+   and uploads `main.bicep` plus the per-resource modules as the artifact `bicep-{env}`
+   (30-day retention). This is the reviewable output; `aspire deploy` regenerates the same
+   templates from the same AppHost and config, so the deploy jobs don't consume the artifact.
+2. **`deploy-staging`** — `aspire deploy -e staging`, tagging both images with the commit sha.
+3. **`deploy-production`** — the same for production, only after staging succeeds.
+
+A manual run takes an `environment` input (`both`, `staging`, `production`) to deploy just one.
+
+`publish-bicep` logs into Azure too, and that isn't optional: the AppHost probes Azure while
+generating templates (does the ACA environment exist? is the resource group mid-deletion? who is
+the deploying principal?), so without a login the generated Bicep wouldn't match what deploys.
+
+### Setup
+
+**Secrets** (Settings → Secrets and variables → Actions). The workflow authenticates as the
+user-assigned managed identity `uai-brett-github` (resource group `brett-demo-resources`) via
+OIDC — federated, so there is no client secret anywhere:
+
+| Secret | Value |
+|---|---|
+| `CLIENT_ID` | `69db8745-ae46-4e0b-b436-ea6c063e7500` (the `clientId` of `uai-brett-github`) |
+| `TENANT_ID` | `0b89df11-aae9-4d55-b967-9242a64a6490` |
+| `SUBSCRIPTION_ID` | `82a8659c-720d-48ab-a58e-bdaa5d42c92a` |
+
+Each job passes these into the [`setup-aspire`](../.github/actions/setup-aspire/action.yml)
+composite action, which installs the toolchain and runs `azure/login`. The values are passed
+from the job rather than read inside the action because **a composite action cannot access the
+`secrets` context** — it only sees what its caller hands it. A missing secret resolves to an
+empty string and fails at login rather than erroring on the name, so if login fails with a blank
+client id, check the secret names first.
+
+The workflow requests `id-token: write`, so the identity needs a federated credential per
+subject. **A job that declares `environment:` gets the environment subject, not the ref
+subject** — which is why three jobs need three credentials. All three already exist on
+`uai-brett-github`:
+
+| Credential | Subject | Used by |
+|---|---|---|
+| `github-main` | `repo:purduebretty/AspireCICDDemo:ref:refs/heads/main` | `publish-bicep` (no environment) |
+| `github-env-staging` | `repo:purduebretty/AspireCICDDemo:environment:staging` | `deploy-staging` |
+| `github-env-production` | `repo:purduebretty/AspireCICDDemo:environment:production` | `deploy-production` |
+
+All three use issuer `https://token.actions.githubusercontent.com` and audience
+`api://AzureADTokenExchange`. A missing subject fails at login with `AADSTS70021`. Running the
+workflow manually from a branch other than `main` won't match `github-main`, so add a credential
+for that ref if you need it. To recreate them:
+
+```bash
+az identity federated-credential create \
+  --name github-env-staging --identity-name uai-brett-github -g brett-demo-resources \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject repo:purduebretty/AspireCICDDemo:environment:staging \
+  --audiences api://AzureADTokenExchange
+```
+
+**Azure permissions.** The identity needs Contributor on the deploy subscription (it creates the
+per-environment resource groups), `AcrPush` on the registry, and — because Aspire creates the
+ACR-pull identity and its `AcrPull` grant — RBAC-write (User Access Administrator or Owner) on
+the registry's resource group. `uai-brett-github` currently holds **Owner on the whole
+subscription**, which covers all of that and then some; anything that runs in this workflow gets
+subscription Owner, so it's worth narrowing to the three grants above if the repo ever takes
+outside contributions.
+
+**Environments** (Settings → Environments): create `staging` and `production`. Adding required
+reviewers to `production` turns the last job into an approval gate — the jobs already declare
+`environment:`, so no workflow change is needed.
+
+### Notes
+
+- A runner starts with **no Aspire deployment state**, so every value resolves from
+  `appsettings.{env}.json` on each run. That sidesteps the stale-state traps described above,
+  and it means generated passwords come from the password vault (or regenerate, with a revision
+  stamp, when the vault isn't readable).
+- The image tag is the commit sha, so a deployed revision traces back to a commit. Retrying a
+  failed run reuses the same tag.
+- Runners are `linux/amd64`, matching what Azure Container Apps requires — no `--platform` flag
+  is needed here, unlike local builds on Apple Silicon.
 
 ## CI/CD via Azure DevOps + Octopus
 

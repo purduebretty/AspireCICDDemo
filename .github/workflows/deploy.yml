@@ -1,0 +1,113 @@
+name: Deploy
+
+# Publishes the generated Bicep for both environments (as a reviewable artifact), then deploys
+# staging and — once staging succeeds — production. Gate either one behind reviewers by adding
+# required reviewers to the matching GitHub Environment (Settings → Environments); the jobs
+# already declare `environment:`, so no workflow change is needed.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deploy a single environment (leave as "both" for the full staging → production run)
+        type: choice
+        options: [both, staging, production]
+        default: both
+
+permissions:
+  id-token: write   # OIDC federated login to Azure — no client secrets
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+
+jobs:
+  # Renders main.bicep + the per-resource modules for every environment and uploads them.
+  # This is for review and audit — `aspire deploy` regenerates the same templates from the same
+  # AppHost and config, so the deploy jobs don't consume the artifact.
+  publish-bicep:
+    name: Publish Bicep (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [staging, production]
+    steps:
+      # actions/checkout@v4 — must precede the local composite action below
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-aspire
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
+
+      # setup-aspire logs in to Azure as well, and that isn't optional for publish: the AppHost
+      # probes Azure while generating templates (does the ACA environment exist? is the resource
+      # group mid-deletion? who is the deploying principal?), so without a login the generated
+      # Bicep would not match what deploys.
+
+      - name: Publish Bicep
+        run: aspire publish -e ${{ matrix.environment }} --non-interactive -o ./artifacts
+        env:
+          Azure__CredentialSource: AzureCli
+
+      # actions/upload-artifact@v4 — pin to a SHA like the actions above if you enforce that.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bicep-${{ matrix.environment }}
+          path: ./artifacts
+          retention-days: 30
+
+  deploy-staging:
+    name: Deploy staging
+    needs: publish-bicep
+    if: inputs.environment != 'production'
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      # actions/checkout@v4 — must precede the local composite action below
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-aspire
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
+
+      # Builds and pushes both images, provisions the Bicep, and deploys the container apps.
+      # The commit sha is the image tag, so a deploy is traceable to a commit and every app
+      # gets a new revision. A runner starts with no Aspire deployment state, so every value
+      # resolves from appsettings.{env}.json — nothing is cached between runs.
+      - name: Deploy
+        run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ github.sha }}
+        env:
+          Azure__CredentialSource: AzureCli
+
+  deploy-production:
+    name: Deploy production
+    needs: deploy-staging
+    # Runs after staging on push; a manual run can target production directly.
+    if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      # actions/checkout@v4 — must precede the local composite action below
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-aspire
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
+
+      - name: Deploy
+        run: aspire deploy -e production --non-interactive -- --Parameters:image-tag=${{ github.sha }}
+        env:
+          Azure__CredentialSource: AzureCli
