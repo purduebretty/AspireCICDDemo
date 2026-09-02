@@ -13,8 +13,7 @@ There are two ways to deploy:
 Both share the model below.
 
 The container registry (`igsops`, **Enterprise Production**) and the Container Apps
-environment (`brettaspiredemo-aab0`, **Enterprise Dev/Test**) live in different
-subscriptions. This works because:
+environment (**Enterprise Dev/Test**) can live in different subscriptions. This works because:
 
 - Images are **pushed to `igsops`** (referenced as an *existing* registry).
 - The apps **pull from `igsops` using a pre-created user-assigned identity**
@@ -58,37 +57,112 @@ and `appsettings.{env}.json`, so they split cleanly:
 
   ```json
   {
-    "Parameters": {
-      "aca-env-name": "brettaspiredemo-aab0",
-      "aca-env-rg": "brett-aspire-demo",
-      "acr-pull-identity-name": "uai-brett-aspire-demp",
-      "acr-pull-identity-rg": "brett-aspire-demo"
-    },
-    "Azure": { "ResourceGroup": "brett-aspire-demo-dev" }
+    "Parameters": { "app-name": "aspire" },
+    "Azure": {
+      "ResourceGroup": "brett-aspire-demo-dev",
+      "AllowResourceGroupCreation": true
+    }
   }
   ```
 
-Each environment deploys its container apps into its **own** resource group
-(`brett-aspire-demo-{env}`, from `Azure:ResourceGroup`), but every environment shares the
-**same** container registry (`igsops`) and the **same, existing** Container Apps environment
-(`brettaspiredemo-aab0` in `aca-env-rg`, referenced as existing — never re-created). The
-`aca-env-*` and `acr-pull-identity-*` values are identical across env files today; only
-`Azure:ResourceGroup` differs.
+**One resource group per environment holds everything.** `Azure:ResourceGroup`
+(`brett-aspire-demo-{env}`) is the default scope for every resource Aspire provisions — the
+container apps, the Container Apps environment, storage, the password vault, and the managed
+identities — and the deployment creates that RG itself (`AllowResourceGroupCreation`).
 
-### App names are suffixed per environment
+**The container registry is the only outlier.** `igsops` is a pre-existing shared registry, so
+it keeps its own `acr-rg` + `acr-subscription`, and the generated template scopes exactly two
+modules there: the registry reference and the `AcrPull` role assignment (which has to be scoped
+where the registry lives). Everything else is scoped to `rg`.
 
-Because every environment shares the one Container Apps environment, and app names must be
-unique *within* a managed environment, the AppHost suffixes each container app with the
-environment name in publish mode: `cache-{env}`, `postgres-{env}`, `server-{env}`. This is
-automatic — it derives from the `-e` value; there's nothing to set per env. Notes:
+That's why `aca-env-rg` and `acr-pull-identity-rg` are absent from the env files: **they default
+to `Azure:ResourceGroup`**. Set one only to point at a resource that lives somewhere else — a
+Container Apps environment shared across environments, say, or a Terraform-managed identity.
 
-- The `server` **resource** keeps its name (so the pushed image repo stays
-  `brettaspiredemo/server` and one image still promotes across envs); only its *deployed
-  container-app* name is suffixed via `PublishAsAzureContainerApp`.
-- The Postgres **database** stays `gamesdb` (only its server app is suffixed), so the
-  Server's `gamesdb` connection lookup is unaffected.
+### Gotcha: deployment state outranks `appsettings.{env}.json`
+
+`aspire deploy` caches every resolved parameter in
+`~/.aspire/deployments/<apphost-hash>/{env}.json`, and that state **wins over the config file**.
+Editing `appsettings.{env}.json` after a deploy therefore appears to do nothing — the AppHost
+keeps using the cached value. Delete the stale keys (or the whole `{env}.json`) to make the file
+authoritative again. CI is unaffected: it starts with no state and passes values as
+`Parameters__name` env vars.
+
+### Missing infrastructure is created, not fatal
+
+The Container Apps environment and the ACR-pull identity may be pre-created (Terraform) and
+referenced as *existing*. A brand-new environment has neither, and referencing a resource that
+doesn't exist fails provisioning with `ResourceNotFound`. So at publish/deploy time the AppHost
+**probes each one** with the deploy credential:
+
+| Probe result | What happens |
+|---|---|
+| Found | Referenced as existing — the deploy never modifies it. |
+| Not found, or not named in config | Aspire **provisions and owns** it (in `Azure:ResourceGroup`). |
+| Lookup failed (no credential / no read permission) | Treated as existing, with a warning — a bad probe never duplicates infrastructure. |
+
+So **omitting `aca-env-name` or `acr-pull-identity-name` from `appsettings.{env}.json` is the
+way to say "Aspire owns this one"** — those parameters are declared only on the
+existing-reference branch, so a missing value creates the resource instead of prompting for it.
+(The matching `-rg` values just default to `Azure:ResourceGroup`.) The **resource group** itself is created by the provisioner, which needs
+`"Azure": { "AllowResourceGroupCreation": true }`. Container **apps** were always created by the
+deploy; nothing changed there.
+
+Two things worth knowing:
+
+- **The ACR-pull identity is all-or-nothing.** `WithAcrPullIdentity` is BYO-identity: it pulls
+  with the identity given and mints *no* role assignment. That is only correct for an identity
+  that already holds `AcrPull`. When the configured identity isn't found, the AppHost passes
+  *none*, so Aspire creates its own identity **and** the `AcrPull` role assignment — which needs
+  RBAC-write in the registry's subscription. That works for a same-subscription registry; for
+  the cross-subscription `igsops` it does not, so pre-create the identity with `AcrPull` in
+  Terraform and name it in config. (Handing `WithAcrPullIdentity` a freshly created identity is
+  what produces `unable to pull image using Managed identity …` on every revision.)
+- **A created ACA environment lands in `Azure:ResourceGroup`** — Aspire provisions one
+  deployment into one RG. It keeps the configured `aca-env-name`, and since `aca-env-rg`
+  defaults to that same RG, the next deploy finds it and references it as existing rather than
+  re-provisioning it (~10 minutes each time). Only an environment deliberately placed elsewhere
+  needs `aca-env-rg` set.
+
+The **registry is never auto-created**: `igsops` is a shared org registry in another
+subscription, and standing up a second one would push images nowhere useful.
+
+Set `"Azure": { "CreateMissingInfrastructure": false }` to disable the probes and always
+reference everything as existing.
+
+### Naming: one knob, everything else derived
+
+`app-name` (default `aspire`) is the only name in the config. Everything else is built from it,
+the environment slug, and a deterministic token:
+
+| | Pattern | Example |
+|---|---|---|
+| Resource (→ ACR repo) | `{app}-{role}` | `aspire-server` |
+| Deployed container app | `{app}-{role}-{env}` | `aspire-server-dev` |
+| Container Apps environment | `{app}-{env}-{token}` | `aspire-dev-jfxu22` |
+| Password vault | `kv-{app}-{env}-{token}` | `kv-aspire-dev-jfxu22` |
+
+The **token** is a deterministic 6-character hash of the target (subscription + resource group)
+plus app and environment — same inputs, same token, on every machine and every deploy, so names
+never churn. It exists for the names that must be *globally* unique: without it, `kv-aspire-dev`
+would collide across subscriptions, and a soft-deleted vault would hold the name hostage for its
+full retention window.
+
+App names carry the environment because several environments may share one Container Apps
+environment, where names must be unique. Notes:
+
+- The **resource** name has no environment or token, so the pushed image repo stays
+  `{app}-server` and one image promotes across envs; only the *deployed container-app* name is
+  suffixed, via `PublishAsAzureContainerApp`.
+- The Postgres **database** stays `gamesdb`, so the Server's `gamesdb` connection lookup is
+  unaffected by any renaming above it.
 - The Redis connection name is baked into the Server as a literal, so the AppHost passes the
-  suffixed name to the Server via `Cache__ConnectionName` (defaults to `cache` locally).
+  real resource name via `Cache__ConnectionName`.
+- `frontend/vite.config.ts` hardcodes the server resource name (`aspire-server`) to build its
+  dev-proxy target — **change `app-name` and you must change that constant too.**
+
+Renaming `app-name` renames everything on the next deploy; the previously deployed resources are
+left behind, not migrated.
 
 ## Deploy
 

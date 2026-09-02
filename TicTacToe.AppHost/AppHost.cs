@@ -8,6 +8,7 @@ using Azure.Provisioning.Authorization;
 using Azure.Provisioning.Expressions;
 using Azure.Provisioning.KeyVault;
 using Azure.Provisioning.Storage;
+using Azure.ResourceManager;
 using Azure.Security.KeyVault.Secrets;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -27,19 +28,48 @@ if (builder.ExecutionContext.IsPublishMode
         TicTacToe.AppHost.ConsolePipelineReporter>();
 }
 
-// Each environment deploys into its own resource group AND its own existing Azure Container Apps
-// environment (see the Azure deployment section below). The cache/postgres resources still carry
-// the target environment as a suffix (cache-dev, postgres-dev, …) via nameSuffix; the
-// server/webfrontend keep stable names so their images stay env-agnostic. In run mode the names
-// stay bare, so local development is unchanged.
+// --- Naming ----------------------------------------------------------------------------
+// ONE knob shapes every name: app-name (default "aspire"). Everything else is derived, so
+// nothing below hardcodes a project-specific string.
+//
+//   resources   {app}-{role}                 aspire-server        (stable → image repo name)
+//   deployed    {app}-{role}-{env}           aspire-server-dev    (container app name)
+//   infra       {app}-{env}-{token}          aspire-dev-k3x9qa    (ACA environment)
+//               kv-{app}-{env}-{token}       kv-aspire-dev-k3x9qa (password vault)
+//
+// The token is a deterministic 6-char hash of the TARGET (subscription + resource group) plus
+// app/environment — stable across deploys of the same target, distinct across targets. That's
+// what keeps globally-unique names (Key Vault above all) from colliding with another
+// environment's, or with a soft-deleted vault of the same name still occupying it.
+//
+// Only the resource group is hardcoded (Azure:ResourceGroup); the container registry is the
+// one other outlier, since it's a pre-existing shared registry with its own name and RG.
 var envSlug = builder.Environment.EnvironmentName.ToLowerInvariant();
+var appName = builder.Configuration["Parameters:app-name"] ?? "aspire";
+
+// The cache/postgres resources carry the target environment as a suffix (…-dev) so several
+// environments can share one Container Apps environment; server/webfrontend keep stable names
+// so their images stay env-agnostic. In run mode every suffix is empty — local dev is unchanged
+// apart from the {app}- prefix, which keeps the dashboard consistent with what gets deployed.
 var nameSuffix = builder.ExecutionContext.IsPublishMode ? $"-{envSlug}" : "";
+var uniqueToken = ShortToken(
+    builder.Configuration["Azure:SubscriptionId"],
+    builder.Configuration["Azure:ResourceGroup"],
+    appName,
+    envSlug);
+
+var cacheName = $"{appName}-cache{nameSuffix}";
+var postgresName = $"{appName}-postgres{nameSuffix}";
+var serverResource = $"{appName}-server";              // stable → ACR repo {app}-server
+var frontendResource = $"{appName}-webfrontend";       // stable → ACR repo {app}-webfrontend
+var serverApp = $"{serverResource}-{envSlug}";         // the deployed container app
+var frontendApp = $"{frontendResource}-{envSlug}";
 
 // Redis — holds live, in-progress game state (the cache).
-var redis = builder.AddRedis($"cache{nameSuffix}");
+var redis = builder.AddRedis(cacheName);
 
 // Postgres — persists finished games and their moves for replay.
-var postgres = builder.AddPostgres($"postgres{nameSuffix}");
+var postgres = builder.AddPostgres(postgresName);
 if (builder.ExecutionContext.IsRunMode)
 {
     // Local-dev persistence only. In Azure this maps to Azure Files, which the
@@ -77,7 +107,7 @@ storage.ConfigureInfrastructure(infra =>
 
 // API backend (ASP.NET Core). The frontend is now its own image (below), so the server just
 // exposes the API. The resource name is STABLE (no env suffix) so the pushed IMAGE is the same
-// for every environment (brettaspiredemo-server); the deployed container-APP name is made
+// for every environment ({app}-server); the deployed container-APP name is made
 // env-specific separately (see the app-name override below).
 // Unlike the cache/db, the Redis *connection name* is baked into the Server's code as a
 // literal ("cache"). Because the cache resource is suffixed per environment, tell the
@@ -86,7 +116,7 @@ storage.ConfigureInfrastructure(infra =>
 // launchSettings.json from the path baked in at BUILD time — which doesn't exist when the
 // published AppHost binary runs on a different deploy agent (crashes with "Project file …
 // was not found"). Publish/deploy never needs the launch profile; run mode keeps it.
-var server = builder.AddProject<Projects.TicTacToe_Server>("brettaspiredemo-server",
+var server = builder.AddProject<Projects.TicTacToe_Server>(serverResource,
         options => options.ExcludeLaunchProfile = builder.ExecutionContext.IsPublishMode)
     .WithReference(redis).WaitFor(redis)
     .WithReference(gamesDb).WaitFor(gamesDb)
@@ -109,26 +139,26 @@ server.WithHttpHealthCheck("/health")
 // own container image by YARP (PublishAsStaticWebsite), which also reverse-proxies /api to
 // the server via service discovery — so the browser stays same-origin (no CORS) and the
 // frontend code is unchanged.
-var webfrontend = builder.AddViteApp("brettaspiredemo-webfrontend", "../frontend")
+var webfrontend = builder.AddViteApp(frontendResource, "../frontend")
     .WithReference(server)
     .WaitFor(server)
     .PublishAsStaticWebsite("/api", server)
     .WithExternalHttpEndpoints();
 
 // The pushed images stay env-agnostic (the resource names above), but the deployed CONTAINER
-// APPS are named per environment (brettaspiredemo-server-dev, brettaspiredemo-webfrontend-dev, …)
+// APPS are named per environment ({app}-server-{env}, {app}-webfrontend-{env}, …)
 // so several environments can share one Azure Container Apps environment without name collisions.
 // PublishAsAzureContainerApp only affects publish/deploy, so run mode is unchanged.
 //
 // Aspire's service discovery — and therefore the frontend's YARP /api proxy — targets the
-// RESOURCE name (brettaspiredemo-server), not this overridden app name, so the generated proxy
+// RESOURCE name ({app}-server), not this overridden app name, so the generated proxy
 // URL would point at a host that doesn't exist. The WithEnvironment overrides in the Azure
 // deployment section below repoint the two service-discovery env vars at the suffixed app name
 // directly in the generated bicep, so no post-deploy `az containerapp update` is needed.
 if (builder.ExecutionContext.IsPublishMode)
 {
-    server.PublishAsAzureContainerApp((_, app) => app.Name = $"brettaspiredemo-server-{envSlug}");
-    webfrontend.PublishAsAzureContainerApp((_, app) => app.Name = $"brettaspiredemo-webfrontend-{envSlug}");
+    server.PublishAsAzureContainerApp((_, app) => app.Name = serverApp);
+    webfrontend.PublishAsAzureContainerApp((_, app) => app.Name = frontendApp);
 }
 
 // --- Azure deployment (publish/deploy only) --------------------------------
@@ -181,20 +211,34 @@ if (builder.ExecutionContext.IsPublishMode)
     // available (e.g. the audit `aspire publish` step), which just omits the role assignment.
     var deployerObjectId = await TryGetDeployerObjectIdAsync(deployCredential);
 
-    var passwordVaultName = $"kv-brettaspiredemo-{envSlug}";   // vault names cap at 24 chars
+    // Key Vault names are globally unique and cap at 24 characters.
+    var passwordVaultName = Truncate($"kv-{appName}-{envSlug}-{uniqueToken}", 24);
     var passwordVault = builder.AddAzureKeyVault("passwords");
     passwordVault.ConfigureInfrastructure(infra =>
     {
         var kv = infra.GetProvisionableResources().OfType<KeyVaultService>().Single();
         // Pin the name (default is uniqueString-based) so the startup read below can find it.
         kv.Name = passwordVaultName;
-        // Org policy: no public endpoints. This demo's shared ACA env has no VNet/private
-        // endpoint yet, so with public access Disabled the vault is unreachable and password
-        // persistence degrades gracefully (regenerate + revision stamp, warnings in the log).
-        // Set "PasswordVault": { "PublicNetworkAccess": "Enabled" } per env to make
-        // persistence functional until private networking exists.
-        kv.Properties.PublicNetworkAccess =
-            builder.Configuration["PasswordVault:PublicNetworkAccess"] ?? "Disabled";
+        // Org policy is "no public endpoints", and with public access Disabled this vault is
+        // unreachable (the ACA environment has no VNet/private endpoint), so password
+        // persistence degrades gracefully — regenerate + revision stamp, warnings in the log.
+        // "PasswordVault": { "PublicNetworkAccess": "Enabled" } per env makes persistence
+        // actually work until private networking exists; dev sets it today.
+        var vaultPublicAccess = builder.Configuration["PasswordVault:PublicNetworkAccess"] ?? "Disabled";
+        kv.Properties.PublicNetworkAccess = vaultPublicAccess;
+
+        // Spell the network rules out rather than leaving them null. Enabled + DefaultAction
+        // Allow is what makes the vault reachable from wherever the deploy runs (agent IPs
+        // vary, so an ip_rules allowlist isn't practical here) — i.e. the vault IS open to the
+        // internet, protected by Azure AD + RBAC alone. That's the trade this switch buys, and
+        // it's the thing to revisit once the environment is VNet-integrated.
+        kv.Properties.NetworkRuleSet = new KeyVaultNetworkRuleSet
+        {
+            Bypass = KeyVaultNetworkRuleBypassOption.AzureServices,
+            DefaultAction = string.Equals(vaultPublicAccess, "Enabled", StringComparison.OrdinalIgnoreCase)
+                ? KeyVaultNetworkRuleAction.Allow
+                : KeyVaultNetworkRuleAction.Deny,
+        };
 
         // Grant the DEPLOYING principal (service connection in CI, az login locally) rights
         // to read/write secrets — the persist-passwords step and the startup read need it.
@@ -245,41 +289,212 @@ if (builder.ExecutionContext.IsPublishMode)
     var acrSub = builder.AddParameter("acr-subscription");   // igsops lives in Enterprise Production.
 
     // Environment-specific (appsettings.{env}.json). Everything except the ACR
-    // lives in the Enterprise Dev/Test subscription (target-subscription).
-    var envName = builder.AddParameter("aca-env-name");
-    var envRg = builder.AddParameter("aca-env-rg");
-    var identityName = builder.AddParameter("acr-pull-identity-name");
-    var identityRg = builder.AddParameter("acr-pull-identity-rg");
+    // lives in the Enterprise Dev/Test subscription (target-subscription). The aca-env-* /
+    // acr-pull-identity-* parameters are declared only on the branches that reference those
+    // resources as existing — an AddParameter with no configured value PROMPTS, so declaring
+    // them unconditionally would block a deploy that is creating the resource instead.
     var targetSub = builder.AddParameter("target-subscription");
+
+    // --- Existing vs. created infrastructure --------------------------------------------
+    // The shared pieces (ACA environment, ACR-pull identity) are normally pre-created by
+    // Terraform and referenced as EXISTING, so a deploy never touches them. But a brand-new
+    // environment has nothing yet, and referencing a resource that doesn't exist fails at
+    // provisioning time ("ResourceNotFound") instead of creating it. So each one is probed
+    // first with the deploy credential: found -> referenced as existing (unchanged behaviour);
+    // missing -> the existing-marker is skipped, and Aspire PROVISIONS it into this
+    // environment's own resource group (Azure:ResourceGroup — which the provisioner itself
+    // creates when Azure:AllowResourceGroupCreation is true, see appsettings.{env}.json).
+    // A probe that can't answer (no credential, no read permission) returns null and keeps the
+    // existing-resource behaviour, so nothing is created by a failed lookup. Config that names
+    // no resource at all is a deliberate "Aspire owns this one" — omit aca-env-name/-rg or
+    // acr-pull-identity-name/-rg from appsettings.{env}.json to have Aspire create and manage it.
+    // Set "Azure": { "CreateMissingInfrastructure": false } to always reference as existing.
+    // The registry is deliberately NOT auto-created: igsops is a shared org registry in another
+    // subscription, and silently standing up a second one would push images nowhere useful.
+    var createMissing = !string.Equals(
+        builder.Configuration["Azure:CreateMissingInfrastructure"], "false",
+        StringComparison.OrdinalIgnoreCase);
+
+    var arm = new ArmClient(deployCredential);
+    var targetSubId = builder.Configuration["Parameters:target-subscription"];
+
+    // ONE default resource group per environment — Azure:ResourceGroup — holds everything
+    // Aspire provisions (container apps, ACA environment, storage, password vault, identities).
+    // The registry is the single outlier: a pre-existing shared ACR that keeps its own acr-rg
+    // and acr-subscription. So aca-env-rg / acr-pull-identity-rg only need setting when that
+    // resource lives somewhere OTHER than the default RG; unset, they fall back to it. The
+    // default RG is created by the provisioner when Azure:AllowResourceGroupCreation is true.
+    var defaultRg = builder.Configuration["Azure:ResourceGroup"];
+
+    // Aspire caches each provisioned module's ARM deployment id in its deployment state and
+    // SKIPS the module when it's still there ("✓ Using existing deployment for storage").
+    // Those ids carry the resource group they were deployed INTO, so changing
+    // Azure:ResourceGroup leaves entries pointing at the old RG: the module is skipped, the
+    // resource never appears in the new RG, and the deploy fails minutes later with
+    // ResourceNotFound (storage account) or FailedIdentityOperation (a container app
+    // referencing an identity that isn't there). Catch that here instead — the only RGs a
+    // cached deployment may legitimately target are the default one and the registry's.
+    var deploymentRgAllowList = new[] { defaultRg, builder.Configuration["Parameters:acr-rg"] }
+        .Where(rg => !string.IsNullOrWhiteSpace(rg))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var stragglers = builder.Configuration.GetSection("Azure:Deployments").GetChildren()
+        .Select(module => (Module: module.Key, Rg: ResourceGroupOf(module["Id"])))
+        .Where(d => d.Rg is not null && !deploymentRgAllowList.Contains(d.Rg))
+        .ToList();
+    if (stragglers.Count > 0)
+    {
+        throw new InvalidOperationException(
+            $"Deployment state has cached deployments in a resource group this deploy no longer " +
+            $"targets ({string.Join(", ", stragglers.Select(d => $"{d.Module} → {d.Rg}"))}). " +
+            $"Aspire would skip those modules and the deploy would fail later with ResourceNotFound. " +
+            $"Delete the stale entries (or the whole file) under " +
+            $"~/.aspire/deployments/<apphost-hash>/{envSlug}.json and deploy again.");
+    }
+
+    // Same trap, different cause: DELETING a resource group leaves its cached deployments
+    // behind in the state file, still naming the RG this deploy targets — so the RG-mismatch
+    // check above sees nothing wrong, Aspire skips those modules as "already deployed", and
+    // the resources never come back. Verify the groups they name still exist.
+    var deployStateSub = builder.Configuration["Azure:SubscriptionId"] ?? targetSubId;
+    foreach (var rg in builder.Configuration.GetSection("Azure:Deployments").GetChildren()
+                 .Select(module => ResourceGroupOf(module["Id"]))
+                 .Where(rg => rg is not null).Distinct(StringComparer.OrdinalIgnoreCase))
+    {
+        if (await ResourceGroupStateAsync(arm, deployStateSub, rg) is null)
+        {
+            throw new InvalidOperationException(
+                $"Deployment state has cached deployments in resource group '{rg}', which no " +
+                $"longer exists. Aspire would skip those modules and the deploy would fail later " +
+                $"with ResourceNotFound. Delete the stale entries (or the whole file) under " +
+                $"~/.aspire/deployments/<apphost-hash>/{envSlug}.json and deploy again.");
+        }
+    }
+
+    // A resource group mid-deletion still resolves, but rejects every write with
+    // ResourceGroupBeingDeleted — and the deploy only discovers that several steps in, after
+    // images have been built and pushed. Fail before any of that work happens.
+    if (string.Equals(await ResourceGroupStateAsync(arm, deployStateSub, defaultRg), "Deleting",
+            StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            $"Resource group '{defaultRg}' is being deleted; Azure rejects every write until that " +
+            "finishes. Wait for the deletion to complete, then deploy again (the group is " +
+            "re-created automatically). Note that deleting the group also soft-deletes the " +
+            "password vault, whose name is globally unique — purge it before redeploying: " +
+            "az keyvault purge -n <vault-name>.");
+    }
+
+    var acaEnvName = builder.Configuration["Parameters:aca-env-name"] ?? $"{appName}-{envSlug}-{uniqueToken}";
+    var acaEnvRg = builder.Configuration["Parameters:aca-env-rg"] ?? defaultRg;
+    var acrPullRg = builder.Configuration["Parameters:acr-pull-identity-rg"] ?? defaultRg;
+
+    var acaEnvExists = createMissing
+        ? await ResourceExistsAsync(arm, targetSubId, acaEnvRg,
+            "Microsoft.App/managedEnvironments", acaEnvName)
+        : null;
+    var acrPullExists = createMissing
+        ? await ResourceExistsAsync(arm, targetSubId, acrPullRg,
+            "Microsoft.ManagedIdentity/userAssignedIdentities",
+            builder.Configuration["Parameters:acr-pull-identity-name"])
+        : null;
+
+
 
     // Only the registry is cross-subscription, so it carries its own subscription scope.
     var igsops = builder.AddAzureContainerRegistry("igsops")
         .PublishAsExistingInResourceGroup(acrName, acrRg, acrSub);
 
-    var acrPull = builder.AddAzureUserAssignedIdentity("acrpull")
-        .PublishAsExistingInResourceGroup(identityName, identityRg, targetSub);
+    var acaEnv = builder.AddAzureContainerAppEnvironment("acaenv");
+    if (acaEnvExists is false)
+    {
+        // Created fresh — pinned to the configured name (the default is uniqueString-based) and
+        // provisioned into Azure:ResourceGroup, not aca-env-rg: Aspire provisions a deployment
+        // into one resource group, so a newly created environment lives with its apps. Later
+        // deploys still won't find it under aca-env-rg and keep managing it here — an idempotent
+        // update of the same resource. Point aca-env-rg at the resource group it actually landed
+        // in (or at a Terraform-created environment) to go back to referencing it as existing.
+        Console.WriteLine(
+            $"info: container apps environment '{acaEnvName}' " +
+            $"was not found in '{acaEnvRg}'; it will be created in " +
+            "this environment's resource group.");
+        acaEnv.ConfigureInfrastructure(infra =>
+        {
+            var managedEnv = infra.GetProvisionableResources()
+                .OfType<ContainerAppManagedEnvironment>().Single();
+            managedEnv.Name = acaEnvName;
+        });
+    }
+    else
+    {
+        acaEnv.PublishAsExistingInResourceGroup(
+            builder.AddParameter("aca-env-name", acaEnvName),
+            builder.AddParameter("aca-env-rg", acaEnvRg!),
+            targetSub);
+    }
 
-    var acaEnv = builder.AddAzureContainerAppEnvironment("acaenv")
-        .PublishAsExistingInResourceGroup(envName, envRg, targetSub)
-        .WithAzureContainerRegistry(igsops)
-        .WithAcrPullIdentity(acrPull);
+    acaEnv.WithAzureContainerRegistry(igsops);
 
-    // Repoint the frontend's /api proxy at the env-suffixed server app. Service discovery
-    // generates these vars from the RESOURCE name (brettaspiredemo-server), but the deployed
-    // app is brettaspiredemo-server-{env}; a later WithEnvironment with the same key wins, so
-    // this bakes the correct FQDN into the generated bicep (replacing the post-deploy
-    // `az containerapp update` repoint the Octopus process performs).
+    // WithAcrPullIdentity is BYO-identity: it tells Aspire to pull with the identity given and
+    // to mint NO role assignment. That is only correct when the identity already exists AND
+    // already holds AcrPull (Terraform grants it) — pointing it at an identity Aspire just
+    // created produces an identity with no permissions, and every revision fails with
+    // "unable to pull image using Managed identity …". So when the pre-created identity isn't
+    // there, don't pass one: Aspire creates its own identity and the AcrPull role assignment
+    // to go with it. That needs RBAC-write in the registry's subscription, which the deploy
+    // principal has for a same-subscription registry but not for the cross-subscription one.
+    if (acrPullExists is not false)
+    {
+        acaEnv.WithAcrPullIdentity(builder.AddAzureUserAssignedIdentity("acrpull")
+            .PublishAsExistingInResourceGroup(
+                builder.AddParameter("acr-pull-identity-name"),
+                builder.AddParameter("acr-pull-identity-rg", acrPullRg!),
+                targetSub));
+    }
+    else
+    {
+        var crossSubscriptionAcr = !string.Equals(
+            builder.Configuration["Parameters:acr-subscription"], targetSubId,
+            StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine(
+            $"info: ACR-pull identity '{builder.Configuration["Parameters:acr-pull-identity-name"]}' " +
+            $"was not found in '{acrPullRg}'; Aspire will " +
+            "create one and grant it AcrPull on the registry." + (crossSubscriptionAcr
+                ? " WARNING: the registry is in a different subscription, so that role assignment " +
+                  "needs RBAC-write there and will likely fail — pre-create the identity with " +
+                  "AcrPull (Terraform) instead."
+                : string.Empty));
+    }
+
+    // Repoint the frontend's /api proxy at the env-suffixed server app. PublishAsStaticWebsite
+    // emits YARP's destination as the RESOURCE name (http://{app}-server) and relies
+    // on Container Apps' in-environment DNS, where an app is reachable at http://{app-name}.
+    // The deployed app is {app}-server-{env}, so the unsuffixed name doesn't resolve
+    // ("Name or service not known (…-server:80)") — YARP dials this address
+    // literally; the services__* vars below are NOT consulted for it. A later WithEnvironment
+    // with the same key wins, so this bakes the corrected destination into the generated bicep
+    // (replacing the post-deploy `az containerapp update` repoint the Octopus process performs).
+    // Staying on the app name keeps the hop INSIDE the environment — no trip out to the public
+    // FQDN and back — which is why this isn't the acaDomain-based URL.
+    webfrontend.WithEnvironment(
+        "REVERSEPROXY__CLUSTERS__api__DESTINATIONS__destination1__ADDRESS",
+        $"http://{serverApp}");
+
+    // Aspire also injects the server's address for service discovery under the resource name,
+    // pointing at the UNSUFFIXED app (which doesn't exist). Nothing reads these today, but
+    // leaving them wrong is a trap for the next thing that does — point them at the real app.
     var acaDomain = acaEnv.GetOutput("AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN");
-    var serverFqdn = ReferenceExpression.Create(
-        $"https://brettaspiredemo-server-{envSlug}.{acaDomain}");
+    var serverFqdn = ReferenceExpression.Create($"https://{serverApp}.{acaDomain}");
+    var serverEnvKey = serverResource.ToUpperInvariant().Replace('-', '_');
     webfrontend
-        .WithEnvironment("services__brettaspiredemo-server__https__0", serverFqdn)
-        .WithEnvironment("services__brettaspiredemo-server__http__0", serverFqdn);
+        .WithEnvironment($"services__{serverResource}__https__0", serverFqdn)
+        .WithEnvironment($"services__{serverResource}__http__0", serverFqdn)
+        .WithEnvironment($"{serverEnvKey}_HTTPS", serverFqdn)
+        .WithEnvironment($"{serverEnvKey}_HTTP", serverFqdn);
 
     // Tag both pushed images with the build number. Pass it to `aspire do push`:
     //   aspire do push -- --Parameters:image-tag=<build-number-or-branch>  (default "latest")
-    // Stable resource names → env-agnostic images (brettaspiredemo-server,
-    // brettaspiredemo-webfrontend): built + pushed once, deployed to every environment. The
+    // Stable resource names → env-agnostic images ({app}-server, {app}-webfrontend):
+    // built + pushed once, deployed to every environment. The
     // container-APP names are made per-environment by the PublishAsAzureContainerApp override
     // above, so environments can share one ACA environment; the deploy repoints the frontend's
     // /api proxy at the suffixed server app name.
@@ -296,11 +511,11 @@ if (builder.ExecutionContext.IsPublishMode)
     // volumes in ACA). When a STABLE password is supplied explicitly (e.g. the pipeline's
     // optional Key Vault fetch → Parameters:cache-{env}-password), the stamp is skipped:
     // nothing drifts, so cache/postgres keep running undisturbed across deploys.
-    if (builder.Configuration[$"Parameters:cache{nameSuffix}-password"] is null)
+    if (builder.Configuration[$"Parameters:{cacheName}-password"] is null)
     {
         redis.WithEnvironment("ASPIRE_DEPLOY_STAMP", imageTag);
     }
-    if (builder.Configuration[$"Parameters:postgres{nameSuffix}-password"] is null)
+    if (builder.Configuration[$"Parameters:{postgresName}-password"] is null)
     {
         postgres.WithEnvironment("ASPIRE_DEPLOY_STAMP", imageTag);
     }
@@ -309,7 +524,7 @@ if (builder.ExecutionContext.IsPublishMode)
     // vault so the NEXT deploy reads them back (stable passwords from run 2 onward). The
     // step is registered without dependencies and wired below only when the deploy-graph
     // steps exist, so publish/push runs simply leave it orphaned (never executed).
-    var passwordParameterNames = new[] { $"cache{nameSuffix}-password", $"postgres{nameSuffix}-password" };
+    var passwordParameterNames = new[] { $"{cacheName}-password", $"{postgresName}-password" };
     builder.Pipeline.AddStep("persist-passwords", async ctx =>
     {
         var client = new SecretClient(
@@ -447,6 +662,102 @@ static async Task<string?> TryGetDeployerObjectIdAsync(Azure.Core.TokenCredentia
     }
     catch
     {
+        return null;
+    }
+}
+
+// The provisioning state of a resource group ("Succeeded", "Deleting", …), or null when it
+// doesn't exist or can't be read — callers treat null as "not there".
+static async Task<string?> ResourceGroupStateAsync(ArmClient arm, string? subscription, string? name)
+{
+    if (string.IsNullOrWhiteSpace(subscription) || string.IsNullOrWhiteSpace(name))
+    {
+        return null;
+    }
+
+    try
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var id = new Azure.Core.ResourceIdentifier($"/subscriptions/{subscription}/resourceGroups/{name}");
+        var group = await arm.GetResourceGroupResource(id).GetAsync(timeout.Token);
+        return group.Value.Data.ResourceGroupProvisioningState;
+    }
+    catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+    {
+        return null;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"warn: could not read the state of resource group '{name}' " +
+                          $"({ex.GetType().Name}); continuing.");
+        return null;
+    }
+}
+
+// The resource group segment of an ARM resource/deployment id, or null when there isn't one.
+static string? ResourceGroupOf(string? id)
+{
+    var match = System.Text.RegularExpressions.Regex.Match(
+        id ?? "", "/resourceGroups/(?<rg>[^/]+)/",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    return match.Success ? match.Groups["rg"].Value : null;
+}
+
+// A short, stable, lowercase-alphanumeric token for the given inputs. Deterministic (same
+// inputs → same token on every machine and every deploy), so names never churn, and it is not
+// a secret — it exists only to keep globally-unique names from colliding across targets.
+static string ShortToken(params string?[] parts)
+{
+    var bytes = System.Security.Cryptography.SHA256.HashData(
+        System.Text.Encoding.UTF8.GetBytes(string.Join("|", parts.Select(p => p ?? ""))));
+    const string alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+    var value = BitConverter.ToUInt64(bytes, 0);
+    return string.Concat(Enumerable.Range(0, 6).Select(_ =>
+    {
+        var c = alphabet[(int)(value % (ulong)alphabet.Length)];
+        value /= (ulong)alphabet.Length;
+        return c;
+    }));
+}
+
+// Trims a generated name to a service's length cap, keeping the trailing uniqueness token
+// (the tail is what makes the name unique, so cut from the middle-left, not the end).
+static string Truncate(string name, int max)
+    => name.Length <= max ? name : string.Concat(name.AsSpan(0, max - 7), name.AsSpan(name.Length - 7));
+
+// Probes whether an Azure resource already exists, using the deploy credential.
+//   true  — found, reference it as existing.
+//   false — nothing to reference (not found, or the config names no resource), so create it.
+//   null  — the lookup itself failed (no credential, no read permission); callers keep the
+//           existing-resource behaviour so a bad probe never duplicates infrastructure.
+static async Task<bool?> ResourceExistsAsync(
+    ArmClient arm, string? subscription, string? resourceGroup, string resourceType, string? name)
+{
+    if (string.IsNullOrWhiteSpace(subscription)
+        || string.IsNullOrWhiteSpace(resourceGroup)
+        || string.IsNullOrWhiteSpace(name))
+    {
+        return false;
+    }
+
+    try
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var id = new Azure.Core.ResourceIdentifier(
+            $"/subscriptions/{subscription}/resourceGroups/{resourceGroup}/providers/{resourceType}/{name}");
+        await arm.GetGenericResource(id).GetAsync(timeout.Token);
+        return true;
+    }
+    catch (Azure.RequestFailedException ex) when (ex.Status == 404)
+    {
+        // The resource group (or the whole path) isn't there either — nothing exists.
+        return false;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine(
+            $"warn: could not check whether {resourceType}/{name} exists ({ex.GetType().Name}); " +
+            "treating it as existing.");
         return null;
     }
 }

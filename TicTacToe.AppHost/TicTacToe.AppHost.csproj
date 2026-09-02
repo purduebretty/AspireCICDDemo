@@ -26,6 +26,9 @@
          Key Vault at publish/deploy time — see the AddAzureKeyVault call in AppHost.cs. -->
     <PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.5.1" />
     <PackageReference Include="Aspire.Hosting.Azure" Version="13.5.3" />
+    <!-- Existence probes for the shared ACA environment / ACR-pull identity, so a missing one
+         is created instead of referenced as existing — see AppHost.cs. -->
+    <PackageReference Include="Azure.ResourceManager" Version="1.14.0" />
     <PackageReference Include="Aspire.Hosting.Azure.AppContainers" Version="13.5.3" />
     <PackageReference Include="Aspire.Hosting.Azure.KeyVault" Version="13.5.3" />
     <PackageReference Include="Aspire.Hosting.Azure.Storage" Version="13.5.3" />
