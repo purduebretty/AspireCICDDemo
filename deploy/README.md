@@ -233,13 +233,24 @@ aspire publish -e dev -o ./artifacts   # writes main.bicep + per-resource module
 (and on demand via **Run workflow**):
 
 0. **`version`** — computes the build number once (see below) and exposes it as a job output.
-1. **`publish-bicep`** — a matrix over `staging` and `production` runs `aspire publish -e {env}`
+1. **`build-push`** — `aspire do push` builds both images and pushes them to the registry, once.
+   That command stops at the push: build → ACR login → push, nothing provisioned or deployed.
+2. **`publish-bicep`** — a matrix over `staging` and `production` runs `aspire publish -e {env}`
    and uploads `main.bicep` plus the per-resource modules as the artifact `bicep-{env}`
    (30-day retention). Staging doesn't consume it — `aspire deploy` regenerates the same
    templates itself — but **production deploys this exact artifact**.
-2. **`deploy-staging`** — `aspire deploy -e staging`, tagging both images with the commit sha.
-3. **`deploy-production`** — applies the **published Bicep artifact** with plain `az`. No Aspire,
+3. **`deploy-staging`** — `aspire deploy -e staging` with `--Parameters:skip-image-build=true`, so
+   it provisions and deploys the images `build-push` already pushed. No rebuild.
+4. **`deploy-production`** — applies the **published Bicep artifact** with plain `az`. No Aspire,
    no .NET, no Docker, not even a checkout of this repo. See below.
+
+A manual run takes an `environment` input (`both`, `staging`, `production`) to deploy just one.
+Because `build-push` runs for every run, a production-only run still has images to deploy.
+
+`publish-bicep` logs into Azure too, and that isn't optional: the AppHost probes Azure while
+generating templates (does the ACA environment exist? is the resource group mid-deletion? who is
+the deploying principal?), so without a login the artifact would be wrong — and production
+deploys that artifact verbatim.
 
 The two deploy jobs are deliberately different, because the contrast is the point: staging shows
 what the tool does for you, production shows what that costs when you hand the artifact to a
@@ -265,13 +276,13 @@ itself records it, so `2026.09.02.42` is enough to find the commit that produced
 Two details that matter more than they look:
 
 - **`run_number`, not `run_attempt`.** `run_number` is stable across re-runs of the same run.
-  Production promotes the image staging pushed, so re-running production alone must resolve to the
-  same tag — with `run_attempt` in the tag it would compute a new one and deploy an image that was
+  Both deploys resolve the tag `build-push` pushed, so re-running a deploy alone must produce the
+  same tag — with `run_attempt` in it, it would compute a new one and deploy an image that was
   never published.
-- **Computed once, in its own job.** Every other job reads
-  `needs.version.outputs.image-tag` rather than recomputing. The date component is why: an approval
-  gate can hold production until the next day, and a per-job `date` would silently produce a
-  different tag than the one staging pushed.
+- **Computed once, in its own job.** Every other job reads `needs.version.outputs.image-tag`
+  rather than recomputing. The date component is why: an approval gate can hold production until
+  the next day, and a per-job `date` would silently produce a different tag than the one
+  `build-push` pushed.
 
 The same value flows everywhere: `aspire publish`/`aspire deploy` receive it as
 `--Parameters:image-tag`, the production job passes it into the container-app modules, and ARM
@@ -388,41 +399,41 @@ template that Aspire deploys itself, wiring ~11 parameters from `main`'s outputs
 Bicep" is really five deployments, and that wiring is now yours to maintain — including the
 server's container port, which nothing in the artifact tells you (it's `8080`).
 
-**5. Nothing builds or pushes an image.** The tags production deploys exist only because
-`deploy-staging` pushed them earlier in the same run. That makes production a true promotion of
-the bits staging validated — but a production-only run would point the apps at images that were
-never published.
+**5. Nothing builds or pushes an image.** The job trusts that its tag exists in the registry; it
+does, because `build-push` runs for every run of this workflow. Applying this artifact anywhere
+else means guaranteeing that yourself — the template references an image without any check that
+it was ever published.
 
 **6. Publish-time values are frozen.** Anything the AppHost computes while generating templates is
 baked in: the probe results above, the deployer's object id in the vault role assignment, and
 `ASPIRE_DEPLOY_STAMP`. That last one is why `publish-bicep` passes the same
-`--Parameters:image-tag=${{ github.sha }}` the deploy uses — without it the stamp would be
+`--Parameters:image-tag` the deploys use — without it the stamp would be
 `latest` and the data services would never get a new revision. An artifact is only valid for the
 target and the moment it was published against.
 
 For comparison, staging expresses all of that as one line: `aspire deploy -e staging`.
 
-### Skipping the image build with Aspire
+### Deploying without rebuilding
 
-If you'd rather have production also run `aspire deploy` and simply not rebuild, the AppHost
-supports it — `--Parameters:skip-image-build=true` trims every build and push step out of the
-pipeline graph, which you can confirm without deploying:
+`build-push` builds the images; both deploys consume them. On the staging side that's
+`--Parameters:skip-image-build=true`, which trims every build and push step out of the pipeline
+graph — confirm the trim without deploying:
 
 ```bash
 aspire deploy --list-steps -e staging -- --Parameters:skip-image-build=true   # no build-*/push-* steps
 ```
 
-It works because the image names are env-agnostic (`{app}-server`, `{app}-webfrontend`) and the
-`*_containerimage` Bicep parameter is *computed* as `{registry}/{resource}:{image-tag}` rather
-than recorded from a push, so any deploy passing the same tag resolves to the same image. The one
-rule: that tag must already exist in the registry.
+It works because the image names are env-agnostic (`{app}-server`, `{app}-webfrontend` — no
+environment in the resource name) and the `*_containerimage` Bicep parameter is *computed* as
+`{registry}/{resource}:{image-tag}` rather than recorded from a push, so any deploy passing the
+same tag resolves to the same image. That's also what lets one build serve both environments. The
+one rule: the tag must already exist in the registry.
 
-A manual run takes an `environment` input (`both`, `staging`, `production`) to deploy just one.
+The same flag is useful locally — redeploy after a failed provision without waiting on Docker:
 
-`publish-bicep` logs into Azure too, and that isn't optional: the AppHost probes Azure while
-generating templates (does the ACA environment exist? is the resource group mid-deletion? who is
-the deploying principal?), so without a login the artifact would be wrong — and production
-deploys that artifact verbatim.
+```bash
+aspire deploy -e staging -- --Parameters:image-tag=<tag> --Parameters:skip-image-build=true
+```
 
 ## CI/CD via Azure DevOps + Octopus
 

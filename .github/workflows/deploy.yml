@@ -62,6 +62,30 @@ jobs:
             echo "| Commit | \`$GITHUB_SHA\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Builds and pushes both images ONCE, for every environment to share. `aspire do push` stops at
+  # the push — build → ACR login → push — so nothing is provisioned or deployed here.
+  #
+  # `-e staging` is arbitrary: the image names are env-agnostic by design (`{app}-server`,
+  # `{app}-webfrontend` — no environment in the resource name), so one build promotes everywhere.
+  # The environment only selects which appsettings the AppHost reads to find the registry.
+  build-push:
+    name: Build and push images
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout@v4 — must precede the local composite action below
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: ./.github/actions/setup-aspire
+        with:
+          client-id: ${{ secrets.CLIENT_ID }}
+          tenant-id: ${{ secrets.TENANT_ID }}
+          subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
+
+      - name: Build and push
+        run: aspire do push -e staging --non-interactive -- --Parameters:image-tag=${{ needs.version.outputs.image-tag }}
+        env:
+          Azure__CredentialSource: AzureCli
+
   # Renders main.bicep + the per-resource modules for every environment and uploads them.
   # Staging doesn't consume the artifact (`aspire deploy` regenerates the templates itself), but
   # deploy-production applies this exact output — so the build number has to be baked in here too,
@@ -101,7 +125,7 @@ jobs:
 
   deploy-staging:
     name: Deploy staging
-    needs: [version, publish-bicep]
+    needs: [version, publish-bicep, build-push]
     if: inputs.environment != 'production'
     runs-on: ubuntu-latest
     environment: staging
@@ -117,13 +141,14 @@ jobs:
           tenant-id: ${{ secrets.TENANT_ID }}
           subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
 
-      # Builds and pushes both images, provisions the Bicep, and deploys the container apps.
-      # Images are tagged with the build number from the `version` job, so a running revision
-      # traces back to a build and a commit. This is the ONLY job that builds images —
-      # production promotes these exact ones. A runner starts with no Aspire deployment state,
-      # so every value resolves from appsettings.{env}.json; nothing is cached between runs.
-      - name: Build, push and deploy
-        run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ needs.version.outputs.image-tag }}
+      # Provisions the Bicep and deploys the container apps — WITHOUT rebuilding.
+      # skip-image-build trims every build/push step out of the pipeline graph, so this deploys
+      # the images `build-push` already pushed under the same tag. Confirm the trim any time with:
+      #   aspire deploy --list-steps -e staging -- --Parameters:skip-image-build=true
+      # A runner starts with no Aspire deployment state, so every value resolves from
+      # appsettings.{env}.json; nothing is cached between runs.
+      - name: Deploy
+        run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ needs.version.outputs.image-tag }} --Parameters:skip-image-build=true
         env:
           Azure__CredentialSource: AzureCli
 
@@ -134,9 +159,9 @@ jobs:
   # the open — see "Deploying the published Bicep" in deploy/README.md for the full list.
   deploy-production:
     name: Deploy production (from published Bicep)
-    needs: [version, publish-bicep, deploy-staging]
+    needs: [version, publish-bicep, build-push, deploy-staging]
     # Runs after staging on push; a manual run can target production directly.
-    if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') && needs.publish-bicep.result == 'success'
+    if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') && needs.publish-bicep.result == 'success' && needs.build-push.result == 'success'
     runs-on: ubuntu-latest
     environment: production
     concurrency:
@@ -268,9 +293,9 @@ jobs:
           SERVER_IDENTITY_CLIENT_ID=$(out aspire_server_identity_clientId)
           BLOB_ENDPOINT=$(out storage_blobEndpoint)
 
-          # DRAWBACK #5: nothing here builds or pushes an image. These tags exist only because
-          # deploy-staging pushed them earlier in this run — production is a pure promotion, and
-          # a production-only run would reference images that were never published.
+          # DRAWBACK #5: nothing here builds or pushes an image — it trusts that this tag exists.
+          # It does, because `build-push` runs for every run of this workflow, staging or not.
+          # Applying this artifact outside the workflow means guaranteeing that yourself.
           SERVER_IMAGE="$ACR_NAME.azurecr.io/aspire-server:$IMAGE_TAG"
           FRONTEND_IMAGE="$ACR_NAME.azurecr.io/aspire-webfrontend:$IMAGE_TAG"
 
