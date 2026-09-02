@@ -50,7 +50,7 @@ jobs:
       # Bicep would not match what deploys.
 
       - name: Publish Bicep
-        run: aspire publish -e ${{ matrix.environment }} --non-interactive -o ./artifacts
+        run: aspire publish -e ${{ matrix.environment }} --non-interactive -o ./artifacts -- --Parameters:image-tag=${{ github.sha }}
         env:
           Azure__CredentialSource: AzureCli
 
@@ -81,33 +81,156 @@ jobs:
 
       # Builds and pushes both images, provisions the Bicep, and deploys the container apps.
       # The commit sha is the image tag, so a deploy is traceable to a commit and every app
-      # gets a new revision. A runner starts with no Aspire deployment state, so every value
+      # gets a new revision. This is the ONLY job that builds images — production reuses these
+      # exact ones (see below). A runner starts with no Aspire deployment state, so every value
       # resolves from appsettings.{env}.json — nothing is cached between runs.
-      - name: Deploy
+      - name: Build, push and deploy
         run: aspire deploy -e staging --non-interactive -- --Parameters:image-tag=${{ github.sha }}
         env:
           Azure__CredentialSource: AzureCli
 
+  # PRODUCTION IS THE CONTRAST: no Aspire, no .NET, no Docker, not even a checkout of this repo.
+  # It takes the Bicep artifact `publish-bicep` produced and applies it with plain `az`, which is
+  # what a hand-off to a separate release tool (Octopus, ADO release stage, a platform team) looks
+  # like. Everything `aspire deploy` was doing for staging implicitly, this job has to do out in
+  # the open — see "Deploying the published Bicep" in deploy/README.md for the full list.
   deploy-production:
-    name: Deploy production
-    needs: deploy-staging
+    name: Deploy production (from published Bicep)
+    needs: [publish-bicep, deploy-staging]
     # Runs after staging on push; a manual run can target production directly.
-    if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    if: always() && inputs.environment != 'staging' && (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped') && needs.publish-bicep.result == 'success'
     runs-on: ubuntu-latest
     environment: production
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+    env:
+      # DRAWBACK #1: `aspire publish` emits templates but no parameters file, and the artifact
+      # doesn't carry the config it was generated from. Every value the AppHost resolved from
+      # appsettings.json has to be re-supplied here by hand — and silently drifts if that file
+      # changes.
+      RESOURCE_GROUP: brett-aspire-demo-production
+      LOCATION: eastus2
+      ACR_NAME: bgoldmandemo
+      ACR_RG: brett-demo-resources
+      ACR_SUBSCRIPTION: 82a8659c-720d-48ab-a58e-bdaa5d42c92a
+      SERVER_CONTAINER_PORT: "8080"
     steps:
-      # actions/checkout@v4 — must precede the local composite action below
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - uses: ./.github/actions/setup-aspire
+      # No checkout: this job consumes the artifact, not the source.
+      - name: Download published Bicep
+        # actions/download-artifact@v4
+        uses: actions/download-artifact@v4
+        with:
+          name: bicep-production
+          path: ./bicep
+
+      - name: Azure login
+        # azure/login@v2
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8
         with:
           client-id: ${{ secrets.CLIENT_ID }}
           tenant-id: ${{ secrets.TENANT_ID }}
           subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
 
-      - name: Deploy
-        run: aspire deploy -e production --non-interactive -- --Parameters:image-tag=${{ github.sha }}
-        env:
-          Azure__CredentialSource: AzureCli
+      # main.bicep needs the deploying principal's object id (it grants that principal access to
+      # the Container Apps environment). The AppHost reads it from the access token's `oid` claim;
+      # do the same here rather than calling Graph, which this identity has no permission for.
+      - name: Resolve deploying principal
+        run: |
+          set -euo pipefail
+          OID=$(az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv \
+            | cut -d. -f2 | python3 -c 'import sys,base64,json; p=sys.stdin.read().strip(); print(json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["oid"])')
+          echo "PRINCIPAL_ID=$OID" >> "$GITHUB_ENV"
+
+      # DRAWBACK #2: the data-service passwords are plain template PARAMETERS. `aspire deploy`
+      # generates them, persists them to the password vault, and reads them back next time; this
+      # path has none of that, so they're regenerated per run — which restarts cache and postgres
+      # every deploy. They must be passed identically to all four app modules or the server won't
+      # match its data services.
+      - name: Generate data-service passwords
+        run: |
+          set -euo pipefail
+          CACHE_PASSWORD=$(openssl rand -hex 16)
+          POSTGRES_PASSWORD=$(openssl rand -hex 16)
+          echo "::add-mask::$CACHE_PASSWORD"
+          echo "::add-mask::$POSTGRES_PASSWORD"
+          echo "CACHE_PASSWORD=$CACHE_PASSWORD" >> "$GITHUB_ENV"
+          echo "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >> "$GITHUB_ENV"
+
+      # main.bicep is SUBSCRIPTION-scoped: it creates the resource group and everything shared —
+      # ACA environment, storage, key vault, identities, role assignments.
+      - name: Deploy infrastructure (main.bicep)
+        run: |
+          set -euo pipefail
+          az deployment sub create \
+            --name "aspire-prod-$GITHUB_RUN_ID" \
+            --location "$LOCATION" \
+            --template-file ./bicep/main.bicep \
+            --parameters \
+              resourceGroupName="$RESOURCE_GROUP" \
+              location="$LOCATION" \
+              principalId="$PRINCIPAL_ID" \
+              acr_name="$ACR_NAME" \
+              acr_rg="$ACR_RG" \
+              acr_subscription="$ACR_SUBSCRIPTION" \
+            --query properties.outputs -o json > infra-outputs.json
+          cat infra-outputs.json
+
+      # DRAWBACK #3: main.bicep does NOT include the container apps. Aspire deploys each app as
+      # its own resource-group-scoped deployment, wiring parameters from the outputs above — so
+      # "just deploy the Bicep" is really five deployments, and this wiring is the part you own.
+      - name: Deploy container apps
+        run: |
+          set -euo pipefail
+          out() { jq -r ".$1.value" infra-outputs.json; }
+          ENV_DOMAIN=$(out acaenv_AZURE_CONTAINER_APPS_ENVIRONMENT_DEFAULT_DOMAIN)
+          ENV_ID=$(out acaenv_AZURE_CONTAINER_APPS_ENVIRONMENT_ID)
+          REGISTRY_ENDPOINT=$(out acaenv_AZURE_CONTAINER_REGISTRY_ENDPOINT)
+          REGISTRY_MI_ID=$(out acaenv_AZURE_CONTAINER_REGISTRY_MANAGED_IDENTITY_ID)
+          SERVER_IDENTITY_ID=$(out aspire_server_identity_id)
+          SERVER_IDENTITY_CLIENT_ID=$(out aspire_server_identity_clientId)
+          BLOB_ENDPOINT=$(out storage_blobEndpoint)
+
+          # DRAWBACK #4: nothing here builds or pushes an image. These tags exist only because
+          # deploy-staging pushed them earlier in this run — production is a pure promotion, and
+          # a production-only run would reference images that were never published.
+          SERVER_IMAGE="$ACR_NAME.azurecr.io/aspire-server:$GITHUB_SHA"
+          FRONTEND_IMAGE="$ACR_NAME.azurecr.io/aspire-webfrontend:$GITHUB_SHA"
+
+          deploy_app() {
+            local name=$1; shift
+            echo "::group::$name"
+            az deployment group create \
+              --name "$name-$GITHUB_RUN_ID" \
+              --resource-group "$RESOURCE_GROUP" \
+              --template-file "./bicep/$name/$name.bicep" \
+              --parameters \
+                location="$LOCATION" \
+                acaenv_outputs_azure_container_apps_environment_default_domain="$ENV_DOMAIN" \
+                acaenv_outputs_azure_container_apps_environment_id="$ENV_ID" \
+                "$@" \
+              --query "properties.provisioningState" -o tsv
+            echo "::endgroup::"
+          }
+
+          deploy_app aspire-cache-production \
+            aspire_cache_production_password_value="$CACHE_PASSWORD"
+
+          deploy_app aspire-postgres-production \
+            aspire_postgres_production_password_value="$POSTGRES_PASSWORD"
+
+          deploy_app aspire-server \
+            aspire_server_containerimage="$SERVER_IMAGE" \
+            aspire_server_containerport="$SERVER_CONTAINER_PORT" \
+            aspire_server_identity_outputs_id="$SERVER_IDENTITY_ID" \
+            aspire_server_identity_outputs_clientid="$SERVER_IDENTITY_CLIENT_ID" \
+            aspire_cache_production_password_value="$CACHE_PASSWORD" \
+            aspire_postgres_production_password_value="$POSTGRES_PASSWORD" \
+            storage_outputs_blobendpoint="$BLOB_ENDPOINT" \
+            acaenv_outputs_azure_container_registry_endpoint="$REGISTRY_ENDPOINT" \
+            acaenv_outputs_azure_container_registry_managed_identity_id="$REGISTRY_MI_ID"
+
+          deploy_app aspire-webfrontend \
+            aspire_webfrontend_containerimage="$FRONTEND_IMAGE" \
+            acaenv_outputs_azure_container_registry_endpoint="$REGISTRY_ENDPOINT" \
+            acaenv_outputs_azure_container_registry_managed_identity_id="$REGISTRY_MI_ID"

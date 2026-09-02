@@ -212,16 +212,15 @@ aspire publish -e dev -o ./artifacts   # writes main.bicep + per-resource module
 
 1. **`publish-bicep`** — a matrix over `staging` and `production` runs `aspire publish -e {env}`
    and uploads `main.bicep` plus the per-resource modules as the artifact `bicep-{env}`
-   (30-day retention). This is the reviewable output; `aspire deploy` regenerates the same
-   templates from the same AppHost and config, so the deploy jobs don't consume the artifact.
+   (30-day retention). Staging doesn't consume it — `aspire deploy` regenerates the same
+   templates itself — but **production deploys this exact artifact**.
 2. **`deploy-staging`** — `aspire deploy -e staging`, tagging both images with the commit sha.
-3. **`deploy-production`** — the same for production, only after staging succeeds.
+3. **`deploy-production`** — applies the **published Bicep artifact** with plain `az`. No Aspire,
+   no .NET, no Docker, not even a checkout of this repo. See below.
 
-A manual run takes an `environment` input (`both`, `staging`, `production`) to deploy just one.
-
-`publish-bicep` logs into Azure too, and that isn't optional: the AppHost probes Azure while
-generating templates (does the ACA environment exist? is the resource group mid-deletion? who is
-the deploying principal?), so without a login the generated Bicep wouldn't match what deploys.
+The two deploy jobs are deliberately different, because the contrast is the point: staging shows
+what the tool does for you, production shows what that costs when you hand the artifact to a
+separate release process (Octopus, an ADO release stage, a platform team).
 
 ### Setup
 
@@ -249,22 +248,34 @@ subject** — which is why three jobs need three credentials. All three already 
 
 | Credential | Subject | Used by |
 |---|---|---|
-| `github-main` | `repo:purduebretty/AspireCICDDemo:ref:refs/heads/main` | `publish-bicep` (no environment) |
-| `github-env-staging` | `repo:purduebretty/AspireCICDDemo:environment:staging` | `deploy-staging` |
-| `github-env-production` | `repo:purduebretty/AspireCICDDemo:environment:production` | `deploy-production` |
+| `github-id-main` | `repo:purduebretty@4551941/AspireCICDDemo@1354943196:ref:refs/heads/main` | `publish-bicep` (no environment) |
+| `github-id-env-staging` | `repo:purduebretty@4551941/AspireCICDDemo@1354943196:environment:staging` | `deploy-staging` |
+| `github-id-env-production` | `repo:purduebretty@4551941/AspireCICDDemo@1354943196:environment:production` | `deploy-production` |
 
-All three use issuer `https://token.actions.githubusercontent.com` and audience
-`api://AzureADTokenExchange`. A missing subject fails at login with `AADSTS70021`. Running the
-workflow manually from a branch other than `main` won't match `github-main`, so add a credential
-for that ref if you need it. To recreate them:
+**The `owner@<owner_id>/repo@<repo_id>` form is not optional here.** GitHub now presents an
+*immutable* subject built from numeric ids rather than names, so a credential written the
+readable way (`repo:purduebretty/AspireCICDDemo:...`) never matches and login fails with
+`AADSTS700213`. The ids come from `https://api.github.com/repos/{owner}/{repo}` (`.owner.id` and
+`.id`), or straight out of the failing run's log — `azure/login` prints the exact **subject
+claim** it presented, which is the string to copy. Name-based duplicates (`github-main`,
+`github-env-staging`, `github-env-production`) are also present as a fallback in case the format
+changes back; they're inert while GitHub sends ids.
+
+All use issuer `https://token.actions.githubusercontent.com` and audience
+`api://AzureADTokenExchange`. Running the workflow manually from a branch other than `main`
+won't match any of these, so add a credential for that ref if you need it. To add one:
 
 ```bash
 az identity federated-credential create \
-  --name github-env-staging --identity-name uai-brett-github -g brett-demo-resources \
+  --name github-id-env-staging --identity-name uai-brett-github -g brett-demo-resources \
   --issuer https://token.actions.githubusercontent.com \
-  --subject repo:purduebretty/AspireCICDDemo:environment:staging \
-  --audiences api://AzureADTokenExchange
+  --audiences api://AzureADTokenExchange \
+  --subject 'repo:purduebretty@4551941/AspireCICDDemo@1354943196:environment:staging'
 ```
+
+Single-quote the subject: in zsh, `$VAR:ref` triggers history modifiers (`:r`, `:e`) and
+silently mangles the string, producing a credential that looks right in a table but never
+matches.
 
 **Azure permissions.** The identity needs Contributor on the deploy subscription (it creates the
 per-environment resource groups), `AcrPush` on the registry, and — because Aspire creates the
@@ -288,6 +299,67 @@ reviewers to `production` turns the last job into an approval gate — the jobs 
   failed run reuses the same tag.
 - Runners are `linux/amd64`, matching what Azure Container Apps requires — no `--platform` flag
   is needed here, unlike local builds on Apple Silicon.
+
+## Deploying the published Bicep
+
+`publish-bicep` renders the templates; `deploy-production` downloads that artifact and applies it
+with `az deployment sub create` plus four `az deployment group create` calls. It works — and the
+gaps you have to fill yourself are the interesting part:
+
+**1. No parameters file.** `aspire publish` emits templates, not the configuration behind them.
+Nothing in the artifact records the resource group, location, or registry it was generated for,
+so the job re-declares all of it in `env:`. Change `appsettings.production.json` and this silently
+drifts — the templates would be regenerated correctly while the job keeps deploying with stale
+values.
+
+**2. `main.bicep` doesn't contain the apps.** It is subscription-scoped and provisions the shared
+infrastructure: the resource group, the Container Apps environment, storage, the password vault,
+the identities, the role assignments. Each container app is a *separate* resource-group-scoped
+template that Aspire deploys itself, wiring ~11 parameters from `main`'s outputs. "Just deploy the
+Bicep" is really five deployments, and that wiring is now yours to maintain — including the
+server's container port, which nothing in the artifact tells you (it's `8080`).
+
+**3. Passwords become your problem.** The data-service passwords are plain template parameters.
+`aspire deploy` generates them, writes them to the password vault, and reads them back on the next
+run. This path has none of that, so the job generates fresh ones each time — which restarts cache
+and postgres on every deploy — and has to thread the identical values through all four modules or
+the server won't match its data services.
+
+**4. Nothing builds or pushes an image.** The tags production deploys exist only because
+`deploy-staging` pushed them earlier in the same run. That makes production a true promotion of
+the bits staging validated — but a production-only run would point the apps at images that were
+never published.
+
+**5. Publish-time values are frozen.** Anything the AppHost computes while generating templates is
+baked in: the probe results for existing resources, the deployer's object id in the vault role
+assignment, and `ASPIRE_DEPLOY_STAMP`. That last one is why `publish-bicep` passes the same
+`--Parameters:image-tag=${{ github.sha }}` the deploy uses — without it the stamp would be
+`latest` and the data services would never get a new revision. An artifact is only valid for the
+target and the moment it was published against.
+
+For comparison, staging expresses all of that as one line: `aspire deploy -e staging`.
+
+### Skipping the image build with Aspire
+
+If you'd rather have production also run `aspire deploy` and simply not rebuild, the AppHost
+supports it — `--Parameters:skip-image-build=true` trims every build and push step out of the
+pipeline graph, which you can confirm without deploying:
+
+```bash
+aspire deploy --list-steps -e staging -- --Parameters:skip-image-build=true   # no build-*/push-* steps
+```
+
+It works because the image names are env-agnostic (`{app}-server`, `{app}-webfrontend`) and the
+`*_containerimage` Bicep parameter is *computed* as `{registry}/{resource}:{image-tag}` rather
+than recorded from a push, so any deploy passing the same tag resolves to the same image. The one
+rule: that tag must already exist in the registry.
+
+A manual run takes an `environment` input (`both`, `staging`, `production`) to deploy just one.
+
+`publish-bicep` logs into Azure too, and that isn't optional: the AppHost probes Azure while
+generating templates (does the ACA environment exist? is the resource group mid-deletion? who is
+the deploying principal?), so without a login the artifact would be wrong — and production
+deploys that artifact verbatim.
 
 ## CI/CD via Azure DevOps + Octopus
 

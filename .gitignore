@@ -45,5 +45,7 @@ msbuild.wrn
 
 # Node.js build artifacts
 node_modules/
-package-lock.json
-package.json
+# NOTE: package.json and package-lock.json are SOURCE, not build artifacts — they must stay
+# tracked. Ignoring them meant a CI checkout had no frontend/package.json, so the generated
+# Dockerfile's `COPY package*.json ./` copied nothing and `npm install` died with ENOENT.
+# The lock file also decides whether Aspire generates `npm ci` (reproducible) or `npm install`.
