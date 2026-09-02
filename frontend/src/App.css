@@ -1,0 +1,227 @@
+:root {
+  --bg: #0f1226;
+  --bg-2: #171b3a;
+  --card: #1d2247;
+  --line: #2c3270;
+  --text: #eef0ff;
+  --muted: #9aa0d0;
+  --primary: #6c5ce7;
+  --primary-2: #5a4bd6;
+  --x: #ff5c7c;
+  --o: #38d6ff;
+  --win: #ffd54a;
+}
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(1200px 600px at 50% -10%, var(--bg-2), var(--bg));
+  color: var(--text);
+}
+
+.app-header {
+  padding: 1.25rem 2rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.brand {
+  font-size: 1.4rem;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.app-nav { display: flex; gap: 1.25rem; }
+.app-nav a { color: var(--muted); text-decoration: none; font-weight: 600; }
+.app-nav a:hover { color: var(--text); }
+
+.main {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 2.5rem 1rem;
+}
+
+.app-footer {
+  padding: 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+
+/* --- Cards & layout ------------------------------------------------------ */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 2rem;
+  width: 100%;
+  max-width: 460px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+
+.card h2 {
+  margin: 0 0 1.25rem;
+  font-size: 1.5rem;
+}
+
+.muted { color: var(--muted); font-weight: 400; }
+.error { color: #ff7a90; margin: 0.5rem 0; }
+
+.row { display: flex; gap: 0.75rem; margin-top: 1.25rem; flex-wrap: wrap; justify-content: center; }
+
+/* --- Home ---------------------------------------------------------------- */
+.home { text-align: center; max-width: 560px; }
+.home .tagline { color: var(--muted); font-size: 1.05rem; margin-bottom: 2rem; }
+.home-actions { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+
+/* --- Buttons ------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  padding: 0.7rem 1.2rem;
+  font-size: 1rem;
+  font-weight: 600;
+  text-decoration: none;
+  color: var(--text);
+  transition: transform 0.08s ease, background 0.15s ease, opacity 0.15s ease;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+.btn-lg { padding: 1rem 1.8rem; font-size: 1.15rem; }
+.btn-sm { padding: 0.45rem 0.9rem; font-size: 0.9rem; }
+.btn-primary { background: var(--primary); }
+.btn-primary:hover { background: var(--primary-2); }
+.btn-secondary { background: #2a2f63; border-color: var(--line); }
+.btn-ghost { background: transparent; border-color: var(--line); color: var(--muted); }
+
+/* --- Setup form ---------------------------------------------------------- */
+.setup form { display: flex; flex-direction: column; gap: 1rem; }
+.setup label { display: flex; flex-direction: column; gap: 0.4rem; font-weight: 600; align-items: flex-start; }
+.setup input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  color: var(--text);
+  font-size: 1rem;
+}
+.setup input:focus { outline: 2px solid var(--primary); border-color: var(--primary); }
+.sym { font-weight: 800; }
+.sym-x { color: var(--x); }
+.sym-o { color: var(--o); }
+
+/* --- Play / scoreboard --------------------------------------------------- */
+.play { text-align: center; }
+.scoreboard {
+  display: flex; align-items: center; justify-content: center; gap: 1rem;
+  font-size: 1.1rem; font-weight: 700; margin-bottom: 0.5rem;
+}
+.scoreboard .vs { color: var(--muted); font-weight: 400; }
+.player-x, .player-x b { color: var(--x); }
+.player-o, .player-o b { color: var(--o); }
+.turn { font-size: 1.1rem; margin: 0.25rem 0 1.25rem; font-weight: 600; }
+.turn .sym-x, .turn .sym-o { font-size: 1.3rem; font-weight: 800; }
+
+/* --- Board --------------------------------------------------------------- */
+.board {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  width: min(360px, 80vw);
+  margin: 0 auto;
+}
+.cell {
+  aspect-ratio: 1;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  font-size: clamp(2rem, 12vw, 3.4rem);
+  font-weight: 800;
+  color: var(--text);
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.12s ease, transform 0.08s ease, box-shadow 0.2s ease;
+}
+.cell:not(:disabled):hover { background: #232a59; transform: translateY(-2px); }
+.cell.x { color: var(--x); }
+.cell.o { color: var(--o); }
+.cell.winning {
+  border-color: var(--win);
+  box-shadow: 0 0 0 2px var(--win), 0 0 24px rgba(255, 213, 74, 0.5);
+}
+
+/* --- Result banner ------------------------------------------------------- */
+.result-banner { margin-top: 1.5rem; }
+.result-banner h2 { font-size: 1.6rem; margin-bottom: 0.5rem; }
+
+/* --- History ------------------------------------------------------------- */
+.history { max-width: 560px; }
+.game-list { list-style: none; margin: 0 0 1.25rem; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+.game-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 0.7rem 0.9rem;
+}
+.game-info { display: flex; flex-direction: column; gap: 0.2rem; text-align: left; font-size: 0.9rem; }
+.game-no { color: var(--muted); font-weight: 700; }
+.game-players { font-weight: 600; }
+.game-result.win { color: var(--win); font-weight: 700; }
+.game-result.draw { color: var(--muted); font-weight: 700; }
+
+/* --- Avatars ------------------------------------------------------------- */
+.avatar {
+  border-radius: 50%;
+  object-fit: cover;
+  background: #2a2f63;
+  border: 2px solid var(--line);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  color: var(--text);
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+.avatar-fallback { text-transform: uppercase; }
+
+/* Player labels (scoreboard + history) sit inline with their avatar. */
+.player { display: inline-flex; align-items: center; gap: 0.5rem; }
+.player-tag { display: inline-flex; align-items: center; gap: 0.35rem; }
+
+/* Name + avatar preview on the new-game setup screen. */
+.name-field { display: flex; align-items: center; gap: 0.6rem; width: 100%; }
+.name-field input { flex: 1; }
+
+/* --- Players page -------------------------------------------------------- */
+.players { max-width: 520px; }
+.player-create { display: flex; gap: 0.6rem; margin: 1rem 0; }
+.player-create input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+  color: var(--text);
+  font-size: 1rem;
+}
+.player-create input:focus { outline: 2px solid var(--primary); border-color: var(--primary); }
+.player-list { list-style: none; margin: 0 0 1.25rem; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }
+.player-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 0.6rem 0.9rem;
+}
+.player-identity { display: flex; align-items: center; gap: 0.75rem; }
+.player-name { font-weight: 600; }

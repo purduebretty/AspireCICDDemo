@@ -1,0 +1,36 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.5.3">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>1221da8f-b55f-458a-b5c9-568cd85c3d01</UserSecretsId>
+    <!-- AddContainerRegistry / WithRemoteImageTag / PublishAsStaticWebsite / the pipeline
+         step-graph APIs (AddPipelineConfiguration) are experimental APIs. -->
+    <NoWarn>$(NoWarn);ASPIRECOMPUTE003;ASPIREPIPELINES001;ASPIREPIPELINES003;ASPIREJAVASCRIPT001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The CI pipeline publishes the AppHost binary (-p:IsPublishable=true) as the deploy
+         artifact; the per-environment config must travel with it. -->
+    <None Update="appsettings*.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TicTacToe.Server\TicTacToe.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets the AppHost pull parameter values (stable data-service passwords) straight from
+         Key Vault at publish/deploy time — see the AddAzureKeyVault call in AppHost.cs. -->
+    <PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.5.1" />
+    <PackageReference Include="Aspire.Hosting.Azure" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.Azure.AppContainers" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.Azure.KeyVault" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.Azure.Storage" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.JavaScript" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" Version="13.5.3" />
+    <PackageReference Include="Aspire.Hosting.Redis" Version="13.5.3" />
+  </ItemGroup>
+</Project>
