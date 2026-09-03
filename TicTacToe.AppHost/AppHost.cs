@@ -1,3 +1,4 @@
+using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Azure;
 using Aspire.Hosting.Pipelines;
 using Azure.Extensions.AspNetCore.Configuration.Secrets;
@@ -13,6 +14,7 @@ using Azure.Security.KeyVault.Secrets;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 var builder = DistributedApplication.CreateBuilder(args);
 
@@ -105,6 +107,56 @@ if (builder.ExecutionContext.IsRunMode)
 // suffixed — the name is the connection key the Server looks up, and the generated
 // connection string still points at the (suffixed) server host, so nothing breaks.
 var gamesDb = postgres.AddDatabase("gamesdb");
+
+// A dashboard command: "Clear game history" on the gamesdb resource, so past games can be wiped
+// between demos without a psql session or a redeploy. It shows up as a button on that resource in
+// the Aspire dashboard (⋯ menu), behind a confirmation prompt.
+//
+// This only exists while the AppHost is running — i.e. `aspire run`. The dashboard deployed
+// alongside the container apps is the standalone one, which has no AppHost to execute commands,
+// so this is a local-dev affordance rather than a production admin tool. That's also why it can
+// safely talk straight to the database instead of exposing a destructive HTTP endpoint on the
+// Server that would be publicly reachable once deployed.
+gamesDb.WithCommand(
+    name: "clear-game-history",
+    displayName: "Clear game history",
+    executeCommand: async context =>
+    {
+        try
+        {
+            // GetConnectionStringAsync is an explicit interface implementation, so it isn't
+            // visible on the concrete resource type — go through the interface.
+            var connectionString = await ((IResourceWithConnectionString)gamesDb.Resource)
+                .GetConnectionStringAsync(context.CancellationToken);
+            await using var connection = new NpgsqlConnection(connectionString);
+            await connection.OpenAsync(context.CancellationToken);
+
+            // moves has a foreign key to games, so both are truncated in one statement — order
+            // doesn't matter then, and RESTART IDENTITY makes the next game start from id 1.
+            // Users are deliberately left alone: they own the avatars in blob storage, and
+            // wiping them would orphan those. Add "users" to the list to clear players too.
+            await using var command = new NpgsqlCommand(
+                "TRUNCATE TABLE moves, games RESTART IDENTITY;", connection);
+            await command.ExecuteNonQueryAsync(context.CancellationToken);
+
+            context.Logger.LogInformation("Game history cleared.");
+            return CommandResults.Success("Game history cleared.");
+        }
+        catch (Exception ex)
+        {
+            // Surfacing the message in the dashboard beats a silent failure — the usual cause is
+            // the database not being up yet.
+            context.Logger.LogError(ex, "Could not clear game history.");
+            return CommandResults.Failure(ex);
+        }
+    },
+    new CommandOptions
+    {
+        Description = "Deletes every finished game and its moves from gamesdb. Players are kept.",
+        ConfirmationMessage = "Delete all past games and moves? This cannot be undone.",
+        IconName = "Delete",
+        IsHighlighted = true,
+    });
 
 // Azure Blob Storage — holds user avatar images. RunAsEmulator means Azurite is
 // used when running locally, while a real storage account is provisioned when
