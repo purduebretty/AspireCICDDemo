@@ -72,10 +72,34 @@ var redis = builder.AddRedis(cacheName);
 var postgres = builder.AddPostgres(postgresName);
 if (builder.ExecutionContext.IsRunMode)
 {
-    // Local-dev persistence only. In Azure this maps to Azure Files, which the
-    // org's "no public network access on storage" policy forbids, so it's omitted.
-    postgres.WithDataVolume();
+    // Local-dev persistence. Users and finished games both live in Postgres, so without a volume
+    // every `aspire run` starts empty.
+    //
+    // The volume name is PINNED rather than left to Aspire, whose default derives from the
+    // RESOURCE name — so renaming the resource (or changing app-name, which renames it) silently
+    // starts a fresh, empty volume and looks exactly like data loss. A fixed name survives both.
+    postgres.WithDataVolume("tictactoe-postgres-data");
+
+    // Pinning the volume alone would be a trap. Aspire's DEFAULT couples both the volume name and
+    // the generated password to the resource name, so a rename resets them together and stays
+    // consistent. Pin only the volume and a rename would keep an already-initialized data
+    // directory while generating a NEW password — Postgres ignores POSTGRES_PASSWORD on an
+    // existing data dir, so startup would fail with 28P01 "password authentication failed", which
+    // looks nothing like the rename that caused it. Pin the password to match. Local dev only:
+    // this container is never published, and publish mode uses generated/vault-backed passwords.
+    postgres.WithPassword(builder.AddParameter("local-postgres-password", "tictactoe-local-dev", secret: true));
+
+    // In-progress games live in Redis, so persist it too — otherwise restarting mid-game drops
+    // the board even though finished games are safe in Postgres. WithPersistence enables RDB
+    // snapshots; without it the volume would just hold an empty dump file.
+    redis.WithDataVolume("tictactoe-cache-data").WithPersistence();
 }
+
+// In Azure neither gets a volume: that maps to an Azure Files (SMB) mount, and Postgres wants
+// POSIX semantics its data directory won't get over SMB. Deployed data is therefore ephemeral —
+// it survives normal operation but not a container restart, and every deploy makes a new
+// revision. Real durability there means Azure Database for PostgreSQL Flexible Server
+// (AddAzurePostgresFlexibleServer + RunAsContainer for local dev).
 
 // The database keeps a stable name ("gamesdb") even though its Postgres server is
 // suffixed — the name is the connection key the Server looks up, and the generated
