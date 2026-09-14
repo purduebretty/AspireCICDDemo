@@ -37,6 +37,9 @@
     <!-- Lets the "Clear game history" dashboard command talk to the games database directly
          (see WithCommand in AppHost.cs). Same version the Server resolves. -->
     <PackageReference Include="Npgsql" Version="10.0.2" />
+    <!-- Lets the "Clear players" dashboard command delete the avatar blobs alongside the user
+         rows (see WithCommand in AppHost.cs). -->
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.28.0" />
     <PackageReference Include="Aspire.Hosting.Redis" Version="13.5.3" />
   </ItemGroup>
 </Project>

@@ -11,6 +11,7 @@ using Azure.Provisioning.KeyVault;
 using Azure.Provisioning.Storage;
 using Azure.ResourceManager;
 using Azure.Security.KeyVault.Secrets;
+using Azure.Storage.Blobs;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -134,7 +135,8 @@ gamesDb.WithCommand(
             // moves has a foreign key to games, so both are truncated in one statement — order
             // doesn't matter then, and RESTART IDENTITY makes the next game start from id 1.
             // Users are deliberately left alone: they own the avatars in blob storage, and
-            // wiping them would orphan those. Add "users" to the list to clear players too.
+            // wiping them here would orphan those. The "Clear players" command below handles
+            // the users table and the avatars together.
             await using var command = new NpgsqlCommand(
                 "TRUNCATE TABLE moves, games RESTART IDENTITY;", connection);
             await command.ExecuteNonQueryAsync(context.CancellationToken);
@@ -191,6 +193,72 @@ storage.ConfigureInfrastructure(infra =>
     account.AllowSharedKeyAccess = false;      // Azure AD only — no SAS, no account keys
     account.AllowBlobPublicAccess = false;     // no anonymous containers
 });
+
+// The companion command: "Clear players" — same local-dev-only affordance (see the comment on
+// "Clear game history" above for why a dashboard command can talk to the database directly),
+// but for the users table. It lives here rather than next to the other command because it also
+// needs the blob container, which is only declared above.
+//
+// Two things differ from clearing games:
+//   * DELETE, not TRUNCATE — games has a foreign key to users, so TRUNCATE would insist on
+//     truncating games as well. The FK is ON DELETE SET NULL, so past games survive with their
+//     player links nulled; the player NAMES are denormalised onto the game row, so history still
+//     reads correctly, just without avatars.
+//   * The avatar blobs go too. They are keyed by user id, so leaving them while restarting the
+//     identity sequence would hand the next player created user 1's old avatar.
+gamesDb.WithCommand(
+    name: "clear-players",
+    displayName: "Clear players",
+    executeCommand: async context =>
+    {
+        try
+        {
+            var connectionString = await ((IResourceWithConnectionString)gamesDb.Resource)
+                .GetConnectionStringAsync(context.CancellationToken);
+            await using var connection = new NpgsqlConnection(connectionString);
+            await connection.OpenAsync(context.CancellationToken);
+
+            // Identity column (not serial), so RESTART WITH goes through ALTER COLUMN; a bare
+            // TRUNCATE RESTART IDENTITY isn't available here for the FK reason above.
+            await using var command = new NpgsqlCommand(
+                """
+                DELETE FROM users;
+                ALTER TABLE users ALTER COLUMN "Id" RESTART WITH 1;
+                """, connection);
+            var deleted = await command.ExecuteNonQueryAsync(context.CancellationToken);
+
+            // Then the avatars. Everything in this container is an avatar, so the whole
+            // container is cleared rather than deleting per surviving user id. Missing container
+            // (nothing uploaded yet in this session) is not an error.
+            var blobConnectionString = await ((IResourceWithConnectionString)blobs.Resource)
+                .GetConnectionStringAsync(context.CancellationToken);
+            var container = new BlobServiceClient(blobConnectionString)
+                .GetBlobContainerClient("userimages");
+            if (await container.ExistsAsync(context.CancellationToken))
+            {
+                await foreach (var blob in container.GetBlobsAsync(cancellationToken: context.CancellationToken))
+                {
+                    await container.DeleteBlobIfExistsAsync(blob.Name,
+                        cancellationToken: context.CancellationToken);
+                }
+            }
+
+            context.Logger.LogInformation("Cleared {Count} player(s) and their avatars.", deleted);
+            return CommandResults.Success($"Cleared {deleted} player(s) and their avatars.");
+        }
+        catch (Exception ex)
+        {
+            context.Logger.LogError(ex, "Could not clear players.");
+            return CommandResults.Failure(ex);
+        }
+    },
+    new CommandOptions
+    {
+        Description = "Deletes every player and their avatar image. Past games are kept, but lose their avatars.",
+        ConfirmationMessage = "Delete all players and their avatars? This cannot be undone.",
+        IconName = "PersonDelete",
+        IsHighlighted = true,
+    });
 
 // API backend (ASP.NET Core). The frontend is now its own image (below), so the server just
 // exposes the API. The resource name is STABLE (no env suffix) so the pushed IMAGE is the same
