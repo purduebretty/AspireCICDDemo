@@ -8,7 +8,7 @@
     <UserSecretsId>1221da8f-b55f-458a-b5c9-568cd85c3d01</UserSecretsId>
     <!-- AddContainerRegistry / WithRemoteImageTag / PublishAsStaticWebsite / the pipeline
          step-graph APIs (AddPipelineConfiguration) are experimental APIs. -->
-    <NoWarn>$(NoWarn);ASPIRECOMPUTE003;ASPIREPIPELINES001;ASPIREPIPELINES003;ASPIREJAVASCRIPT001</NoWarn>
+    <NoWarn>$(NoWarn);ASPIRECOMPUTE003;ASPIREPIPELINES001;ASPIREPIPELINES003;ASPIREJAVASCRIPT001;ASPIRECERTIFICATES001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

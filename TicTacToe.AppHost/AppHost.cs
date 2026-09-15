@@ -300,6 +300,42 @@ var webfrontend = builder.AddViteApp(frontendResource, "../frontend")
     .PublishAsStaticWebsite("/api", server)
     .WithExternalHttpEndpoints();
 
+// Local URL for the frontend: https://tictactoe.dev.localhost:8443 (run mode only).
+//
+// Three things are needed, and all three are about the Vite dev server:
+//
+//   * An https endpoint on a fixed port. Vite's port is otherwise allocated per run, and a URL
+//     meant to be typed can't move every time. 8443 rather than 443 because only root may bind
+//     below 1024 on macOS.
+//   * TLS turned on. AddViteApp ships with `.WithoutHttpsCertificate()` and the comment "Making
+//     TLS opt-in for Vite for now", so a Vite resource serves plaintext by default — the URL
+//     would say https:// while the socket speaks HTTP. Putting the annotation back opts in, and
+//     Aspire then wraps vite.config.ts in a generated config that sets server.https from a PFX it
+//     passes in TLS_CONFIG_PFX ("Applying Aspire specific Vite configuration for HTTPS support"
+//     shows up in the resource log). Our config is the function form and keeps its own
+//     server.proxy — the wrapper preserves both, so nothing in frontend/ changes.
+//   * The hostname. TargetHost changes the address PRESENTED, not what is bound: Vite still
+//     listens on loopback and *.dev.localhost resolves there. The name has to be one label under
+//     .dev.localhost because that is what the ASP.NET Core dev certificate's "*.dev.localhost"
+//     SAN covers — so it is trusted with nothing to install, and a TLS wildcard matches a single
+//     label only.
+//
+// /api is unaffected: the browser stays on one origin and Vite proxies /api to the server as
+// before, which is also how the deployed image behaves.
+if (builder.ExecutionContext.IsRunMode)
+{
+    webfrontend
+        .WithHttpsEndpoint(port: 8443)
+        .WithAnnotation(
+            new HttpsCertificateAnnotation { Certificate = null, UseDeveloperCertificate = true },
+            ResourceAnnotationMutationBehavior.Replace)
+        .WithEndpoint("https", e => e.TargetHost = "tictactoe.dev.localhost")
+        // AddViteApp's own http endpoint stays (its PORT env var refers to it) but is dropped from
+        // the dashboard summary, so the resource lists the one URL worth clicking instead of that
+        // plus a localhost:<random> that changes every run. Still on the resource's detail pane.
+        .WithUrlForEndpoint("http", u => u.DisplayLocation = UrlDisplayLocation.DetailsOnly);
+}
+
 // The pushed images stay env-agnostic (the resource names above), but the deployed CONTAINER
 // APPS are named per environment ({app}-server-{env}, {app}-webfrontend-{env}, …)
 // so several environments can share one Azure Container Apps environment without name collisions.
